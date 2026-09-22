@@ -1,0 +1,54 @@
+# Maintainer: Ayoub Zulfiqar <contact@ayoubzulfiqar.com>
+#
+# Arch Linux package for trace. Also usable as an AUR PKGBUILD: run
+# `updpkgsums` after bumping pkgver to pin the release tarball checksum.
+
+pkgname=trace
+pkgver=2.6.9
+pkgrel=1
+pkgdesc="Architectural memory engine and MCP server for AI coding agents"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ayoubzulfiqar/trace"
+license=('MIT')
+depends=('gcc-libs' 'glibc')
+makedepends=('cargo')
+# The bundled C code (tree-sitter grammars, SQLite) is archived with plain
+# `ar`; LTO bitcode objects in those archives fail to link.
+options=('!lto')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    export CARGO_TARGET_DIR=target
+    cargo build --frozen --release
+    ./target/release/trace completions bash > trace.bash
+    ./target/release/trace completions zsh > _trace
+    ./target/release/trace completions fish > trace.fish
+    ./target/release/trace man > trace.1
+}
+
+check() {
+    cd "$pkgname-$pkgver"
+    export RUSTUP_TOOLCHAIN=stable
+    cargo test --frozen
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/trace "$pkgdir/usr/bin/trace"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 docs/USAGE.md "$pkgdir/usr/share/doc/$pkgname/USAGE.md"
+    install -Dm644 trace.1 "$pkgdir/usr/share/man/man1/trace.1"
+    install -Dm644 trace.bash "$pkgdir/usr/share/bash-completion/completions/trace"
+    install -Dm644 _trace "$pkgdir/usr/share/zsh/site-functions/_trace"
+    install -Dm644 trace.fish "$pkgdir/usr/share/fish/vendor_completions.d/trace.fish"
+}
