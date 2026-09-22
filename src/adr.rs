@@ -19,10 +19,10 @@ pub const DECISIONS_DIR: &str = "docs/decisions";
 /// A searchable ADR record (mirrors the Markdown front-matter).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AdrRecord {
-    pub id: String,       // e.g. "0001"
+    pub id: String, // e.g. "0001"
     pub title: String,
-    pub status: String,   // Accepted | Superseded | Proposed | Deprecated
-    pub date: String,     // YYYY-MM-DD
+    pub status: String, // Accepted | Superseded | Proposed | Deprecated
+    pub date: String,   // YYYY-MM-DD
     pub context: String,
     pub decision: String,
     #[serde(default)]
@@ -58,7 +58,12 @@ fn current_date() -> String {
     let days_since_epoch = secs / 86400;
     let day_of_year = (days_since_epoch % 365) as u32 + 1;
     let year = 1970 + (days_since_epoch / 365);
-    format!("{}-{:02}-{:02}", year, (day_of_year / 30).min(12), (day_of_year % 30).min(30))
+    format!(
+        "{}-{:02}-{:02}",
+        year,
+        (day_of_year / 30).min(12),
+        (day_of_year % 30).min(30)
+    )
 }
 
 /// Find the next available ADR sequence number.
@@ -84,7 +89,13 @@ pub fn next_id(decisions_dir: &Path) -> String {
 }
 
 /// Record a new ADR as a Markdown file in `docs/decisions/`.
-pub fn record_decision(root: &Path, title: &str, context: &str, decision: &str, consequences: &str) -> PathBuf {
+pub fn record_decision(
+    root: &Path,
+    title: &str,
+    context: &str,
+    decision: &str,
+    consequences: &str,
+) -> PathBuf {
     let decisions_dir = root.join(DECISIONS_DIR);
     fs::create_dir_all(&decisions_dir).unwrap();
 
@@ -195,7 +206,13 @@ fn extract_section(body: &str, header: &str) -> String {
 fn slugify(s: &str) -> String {
     s.to_lowercase()
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect::<String>()
         .trim_matches('-')
         .to_string()
@@ -219,8 +236,7 @@ pub fn search_decisions(root: &Path, query: &str) -> Vec<AdrRecord> {
             if let Some(record) = parse_adr(&path) {
                 let haystack = format!(
                     "{} {} {} {} {}",
-                    record.title, record.context, record.decision,
-                    record.consequences, record.id
+                    record.title, record.context, record.decision, record.consequences, record.id
                 )
                 .to_lowercase();
                 if query_lower.is_empty() || haystack.contains(&query_lower) {
