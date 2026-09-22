@@ -21,22 +21,19 @@ jobs:
             runner: ubuntu-22.04
             os_name: linux
             arch: x86_64
-            cross_linker: ""
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-22.04
             os_name: linux
             arch: aarch64
-            cross_linker: aarch64-linux-gnu-gcc
           - target: x86_64-apple-darwin
             runner: macos-13
             os_name: macos
             arch: x86_64
-            cross_linker: ""
           - target: aarch64-apple-darwin
             runner: macos-14
             os_name: macos
             arch: aarch64
-            cross_linker: ""
+
     steps:
       - uses: actions/checkout@v4
 
@@ -45,21 +42,24 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross linker (Linux aarch64)
-        if: matrix.cross_linker != ""
+      - name: Install aarch64 cross-linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - name: Build
+      - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'aarch64-linux-gnu-gcc' || '' }}
 
-      - name: Package
+      - name: Package tarball
         run: |
           tar czf "trace-${{ github.ref_name }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz" \
             -C "target/${{ matrix.target }}/release" trace
+
+      - name: Show binary
+        run: file "target/${{ matrix.target }}/release/trace"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -68,21 +68,30 @@ jobs:
           path: "trace-*.tar.gz"
 
   release:
-    name: Create release
+    name: Publish release
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: read
+
     steps:
-      - uses: actions/download-artifact@v4
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
         with:
           path: artifacts
 
-      - name: Gather packages
+      - name: Copy packages
         run: |
-          find artifacts -name '*.tar.gz' -exec mv {} . \;
+          mkdir -p release
+          find artifacts -type f -name '*.tar.gz' -exec cp {} release/ \;
+          ls -la release/
 
-      - name: Create release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: '*.tar.gz'
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: release/trace-*.tar.gz
+          fail_on_unmatched_files: false
