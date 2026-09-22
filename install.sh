@@ -131,9 +131,14 @@ main() {
     "$binary_path" setup || true
 
     echo ""
+    echo "Installing system service (background daemon)..."
+    "$binary_path" service install || true
+
+    echo ""
     echo "✓ Installation complete."
     echo "  Run 'trace scan <project>' to index a codebase."
-    echo "  Run 'trace serve <project>' to start the MCP server."
+    echo "  Run 'trace serve <project>' to start the MCP server (connects to daemon)."
+    echo "  Run 'trace daemon <project>' to start the background daemon directly."
 }
 
 main "$@"
