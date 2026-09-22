@@ -39,19 +39,24 @@ An architectural memory engine and MCP server for Rust projects. Provides real-t
 
 ### MCP Server
 
-- **JSON-RPC 2.0 over stdio**: Reads requests from stdin, writes responses to stdout. Compatible with any MCP client (Claude Desktop, OpenCode, custom tooling).
-- **9 exposed tools**: `get_symbol_outline`, `find_callers`, `get_imports`, `eval_plan`, `search_decisions`, `record_decision`, `get_recent_history`, `log_session`, `list_resources`.
-- **Resource listing**: `list_resources` exposes the indexed file graph, rule set, ADR collection, and session history as browsable resources.
+- **JSON-RPC 2.0 over stdio**: Reads requests from stdin, writes responses to stdout. Compatible with any MCP client (Claude Desktop, OpenCode, Cursor, Windsurf, custom tooling).
+- **Daemon + Shim architecture**: `trace serve` runs as a lightweight stdio shim that proxies to a background daemon (`trace daemon`). The daemon listens on a per-project Unix socket, giving all agents access to a single shared index and SQLite store. If the daemon isn't running, `trace serve` auto-spawns it and falls back to inline stdio mode.
+- **9 exposed tools**: `get_symbol_outline`, `find_callers`, `get_imports`, `eval_plan`, `search_decisions`, `record_decision`, `get_recent_history`, `scan_repo`, `scan_incremental`.
+-
+- **Concurrency**: SQLite runs in WAL mode for safe concurrent read/write access from multiple agent shims.
 
 ### CLI
 
-```
-trace serve [root]     Start the MCP server (stdio mode)
-trace scan <root>      Index a repository and print summary statistics
-trace setup            Auto-detect installed AI agents and inject MCP config
-trace list-agents       List discovered AI agents (read-only, no modifications)
-trace test             Run all tests
-```
+| Command | Description |
+|---|---|
+| `trace serve [root]` | Start the MCP server as a stdio shim that proxies to the daemon |
+| `trace daemon [root]` | Run the MCP server as a background daemon (Unix socket listener) |
+| `trace scan [root]` | Index a repository and print summary statistics |
+| `trace setup` | Auto-detect installed AI agents and inject MCP config + write discovery registry |
+| `trace list-agents` | List discovered AI agents (read-only, no modifications) |
+| `trace service install [root]` | Install trace as a system service (systemd/launchd) for auto-start on boot |
+| `trace service uninstall` | Remove the trace system service definition |
+| `trace test` | Run all tests |
 
 ## Installation
 
@@ -61,7 +66,7 @@ trace test             Run all tests
 curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/trace/main/install.sh | sh
 ```
 
-This downloads a pre-compiled binary for your OS/architecture, installs it to `/usr/local/bin` (or `~/.local/bin`), and runs `trace setup` to auto-register the MCP server with any installed AI agents.
+This downloads a pre-compiled binary for your OS/architecture, installs it to `/usr/local/bin` (or `~/.local/bin`), runs `trace setup` to auto-register the MCP server with any installed AI agents, and `trace service install` to create a system service for the background daemon.
 
 ### From source
 
@@ -106,7 +111,9 @@ This scans for config files at known paths:
 | Cursor | `~/.cursor/mcp.json` | JSON |
 | Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
 
-For each discovered agent, `trace setup` injects a `trace` server entry pointing to the installed binary (resolved via `std::env::current_exe()` with PATH fallback). Existing server entries are preserved.
+For each discovered agent, `trace setup` injects a `trace` server entry pointing to the installed binary (resolved via `std::env::current_exe()` with PATH fallback). Existing server entries are preserved. A `trace serve` entry connects to the shared background daemon automatically.
+
+`trace setup` also writes a `~/.trace/discovery.json` registry containing the binary path, socket base directory, and registered agent names, enabling future agents to auto-discover trace without manual configuration.
 
 Use `trace list-agents` to see which agents are detected without modifying any configs.
 
@@ -115,24 +122,52 @@ Use `trace list-agents` to see which agents are detected without modifying any c
 ```
 trace/
 ├── src/
-│   ├── main.rs              CLI entry: serve, scan, setup, list-agents, test
+│   ├── main.rs              CLI entry: serve, daemon, scan, setup, list-agents, service, test
 │   ├── lib.rs               Module declarations and re-exports
 │   ├── structural.rs        AST indexing: StructuralGraph, Symbol, Import, Route, tree-sitter extraction
 │   ├── scan.rs              Incremental file scanning with hash-based change detection
 │   ├── tree_sitter_detector.rs  Parser language detection by file extension
 │   ├── invariant.rs         Constraint engine: rules matching and plan evaluation
 │   ├── adr.rs               Architecture Decision Records: parsing, searching, recording
-│   ├── store.rs             SQLite-backed execution memory: sessions and touched files
-│   ├── mcp.rs               MCP server: JSON-RPC dispatch, tool handlers, resource listing
+│   ├── store.rs             SQLite execution memory (WAL mode): sessions, touched files, events
+│   ├── mcp.rs               MCP server: JSON-RPC dispatch, daemon/shim, tool handlers, resources
+│   ├── service.rs           System service management: systemd unit / launchd plist generation
+│   ├── setup.rs             Agent auto-discovery and MCP config injection
 │   ├── model.rs             Data models: Rule, Violation, Decision, Index, SessionRecord
 │   ├── humanize.rs          Human-readable relative timestamps for session history
-│   ├── root.rs              Project root discovery via upward directory walk
-│   └── lib.rs               Module declarations and re-exports
+│   └── root.rs              Project root discovery via upward directory walk
 ├── docs/
 │   └── decisions/           ADR Markdown files (created by record_decision)
-├── install.sh               One-line installer with auto-discovery
+├── install.sh               One-line installer with auto-discovery + service registration
 └── Cargo.toml
 ```
+
+## Daemon Architecture
+
+### Background daemon + stdio shim
+
+Spawning a separate `stdio` process for each agent (Claude Desktop, Cursor, OpenCode, Hermes) duplicates RAM and fragments the index — each agent gets its own isolated copy of the AST cache and SQLite store. `trace` solves this with a **shared daemon + shim** pattern:
+
+1. **Daemon** (`trace daemon <root>`): A long-lived process that listens on a **per-project Unix socket** at `~/.trace/project-<hash>/daemon.sock`. The socket path is derived from the absolute path of the project root, so each project gets its own daemon instance with independent state.
+
+2. **Shim** (`trace serve <root>`): When an agent spawns `trace serve`, the shim checks if the daemon for that project is alive. If it is, the shim forwards JSON-RPC requests over the Unix socket and writes responses to stdout. If the daemon isn't running, the shim **auto-spawns** it in the background and then proxies. If the daemon can't start, the shim falls back to inline stdio mode.
+
+3. **Per-project isolation**: Each project root gets its own `.trace/` directory (SQLite index + AST cache) and its own daemon socket. Switching between projects doesn't mix state.
+
+### Concurrency & resilience
+
+- **WAL mode**: SQLite runs in `journal_mode=WAL` with `synchronous=NORMAL`, allowing concurrent readers and a single writer without database locks when multiple agent shims issue queries simultaneously.
+- **Self-healing**: If the daemon crashes, the next `trace serve` invocation auto-restarts it. System service integration (`trace service install`) registers the daemon with systemd or launchd for automatic restart on boot and crash recovery.
+
+### Discovery registry
+
+After `trace setup`, a `~/.trace/discovery.json` file is written containing:
+- The trace binary path
+- The socket base directory
+- A list of registered agents
+- An `mcp://trace` URI for future agent auto-discovery
+
+Future agents can read this registry to discover trace without manual configuration.
 
 ## Usage
 
@@ -161,7 +196,11 @@ trace serve /path/to/project
 The server maintains persistent state in `.trace/` under the project root:
 
 - `.trace/index/` — `redb` key-value store for incremental parsing
-- `.trace/trace.db` — SQLite database for execution memory
+- `.trace/trace.db` — SQLite database for execution memory (WAL mode)
+
+The shared daemon listens on a per-project Unix socket at `~/.trace/project-<hash>/daemon.sock`.
+
+`trace serve` auto-connects to the daemon (spawning it if necessary). To run the daemon directly: `trace daemon /path/to/project`.
 
 ### Example MCP tool calls
 
