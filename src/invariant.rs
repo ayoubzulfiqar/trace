@@ -110,7 +110,8 @@ pub fn check_rule(
     if !path_matches(&rule.target_path, file_rel) {
         return out;
     }
-    let (symbols, imports, _routes) = crate::structural::extract_file(file_rel, file_ext, file_content);
+    let (symbols, imports, _routes) =
+        crate::structural::extract_file(file_rel, file_ext, file_content);
     // Forbidden imports
     for fi in &rule.forbidden_imports {
         for imp in &imports {
@@ -121,7 +122,10 @@ pub fn check_rule(
                     severity: rule.severity,
                     file: file_rel.to_string(),
                     line: None,
-                    detail: format!("forbidden import '{}' -> '{}'", imp.from_file, imp.to_module),
+                    detail: format!(
+                        "forbidden import '{}' -> '{}'",
+                        imp.from_file, imp.to_module
+                    ),
                 });
             }
         }
@@ -136,7 +140,10 @@ pub fn check_rule(
                     severity: rule.severity,
                     file: file_rel.to_string(),
                     line: Some(sym.line),
-                    detail: format!("forbidden symbol '{}' defined at line {}", sym.name, sym.line),
+                    detail: format!(
+                        "forbidden symbol '{}' defined at line {}",
+                        sym.name, sym.line
+                    ),
                 });
             }
         }
@@ -273,9 +280,13 @@ mod tests {
         }"#;
         std::fs::write(dir.join(".architectural-rules.json"), rules).unwrap();
 
-        let result = eval_plan(&dir, &[
-            ("src/controllers/user.rs".to_string(), "use crate::db::pool;".to_string()),
-        ]);
+        let result = eval_plan(
+            &dir,
+            &[(
+                "src/controllers/user.rs".to_string(),
+                "use crate::db::pool;".to_string(),
+            )],
+        );
         assert!(!result.is_allowed());
         assert_eq!(result.violations.len(), 1);
         assert_eq!(result.violations[0].rule_id, "no-db-in-controllers");
@@ -294,9 +305,13 @@ mod tests {
         }"#;
         std::fs::write(dir.join(".architectural-rules.json"), rules).unwrap();
 
-        let result = eval_plan(&dir, &[
-            ("src/controllers/user.rs".to_string(), "use crate::service::Service;".to_string()),
-        ]);
+        let result = eval_plan(
+            &dir,
+            &[(
+                "src/controllers/user.rs".to_string(),
+                "use crate::service::Service;".to_string(),
+            )],
+        );
         assert!(result.is_allowed());
         assert!(result.violations.is_empty());
     }
@@ -324,9 +339,10 @@ mod tests {
         std::fs::write(dir.join(".architectural-rules.json"), rules).unwrap();
 
         let code = "pub fn execute_sql() {}\npub fn handler() { execute_sql(); }";
-        let result = eval_plan(&dir, &[
-            ("src/controllers/handler.rs".to_string(), code.to_string()),
-        ]);
+        let result = eval_plan(
+            &dir,
+            &[("src/controllers/handler.rs".to_string(), code.to_string())],
+        );
         assert!(!result.is_allowed());
     }
 }
