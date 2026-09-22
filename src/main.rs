@@ -2,7 +2,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "trace", about = "Architectural Memory Engine — Rust MCP server")]
+#[command(
+    name = "trace",
+    about = "Architectural Memory Engine — Rust MCP server"
+)]
 struct Cli {
     #[clap(subcommand)]
     cmd: Commands,
@@ -24,6 +27,10 @@ enum Commands {
     },
     /// Run all tests
     Test,
+    /// Auto-detect installed AI agents and inject MCP server config
+    Setup,
+    /// List discovered AI agents (read-only)
+    ListAgents,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -50,6 +57,14 @@ fn main() -> anyhow::Result<()> {
         }
         Commands::Test => {
             eprintln!("Run `cargo test` instead");
+            Ok(())
+        }
+        Commands::Setup => {
+            trace::setup::auto_detect_and_register()?;
+            Ok(())
+        }
+        Commands::ListAgents => {
+            trace::setup::list_agents()?;
             Ok(())
         }
     }
