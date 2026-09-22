@@ -1,597 +1,2089 @@
-//! MCP server over stdio: JSON-RPC 2.0 with MCP tool dispatch.
-//! Implements 8 tools across all 4 phases:
-//! Phase 1: get_symbol_outline, find_callers, get_imports
-//! Phase 2: eval_plan
-//! Phase 3: search_decisions, record_decision
-//! Phase 4: get_recent_history
+//! MCP server: JSON-RPC 2.0 message handling and the tool surface.
 //!
-//! Supports two run modes:
-//! - `trace serve` (stdio shim): proxies JSON-RPC requests to a background daemon
-//!   via Unix socket, auto-starting the daemon if needed. Falls back to inline
-//!   stdio mode if the daemon cannot be started.
-//! - `trace daemon` (background daemon): listens on a Unix socket and processes
-//!   requests with full project state.
-use serde_json::{json, Value};
-use std::io::{self, BufRead, Read, Write};
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::{Arc, Mutex};
-use std::thread;
+//! Tools, by phase:
+//! - Phase 1 (structure): `get_symbol_outline`, `find_symbol`, `find_callers`,
+//!   `find_callees`, `get_imports`, `find_importers`, `list_routes`,
+//!   `scan_repo`, `scan_incremental`
+//! - Phase 2 (guardrails): `eval_plan`, `list_rules`
+//! - Phase 3 (decisions): `search_decisions`, `record_decision`
+//! - Phase 4 (memory): `record_session`, `get_recent_history`, `get_file_history`
+//!
+//! [`Server`] is `Send + Sync`: the daemon shares one instance across all
+//! connections. The structural index is loaded from SQLite on first use and
+//! refreshed incrementally (stat walk, re-parse only changed files) before
+//! any index query once it is older than the refresh interval. Transport
+//! (stdio, Unix socket daemon, shim) lives in `daemon.rs`.
 
-use crate::adr::{record_decision as adr_record, search_decisions};
-use crate::invariant::eval_plan;
-use crate::scan::{scan_incremental, scan_repo};
+use crate::adr::{self, NewDecision, SearchOptions};
+use crate::humanize::{age_label, now_ms};
+use crate::invariant::{self, PlannedFile};
+use crate::model::{DecisionStatus, SessionRecord, TouchedFileRecord};
+use crate::root::{is_broad_root, resolve_in_root};
+use crate::scan::{self, ScanStats};
 use crate::store::TraceStore;
-use crate::structural::{extract_file, is_scannable_ext, StructuralGraph};
+use crate::structural::{
+    call_targets, extract_with_lang, path_has_prefix, CallMatch, Resolver, StructuralGraph, Symbol,
+    SymbolKind, SymbolQuery, MAX_FILE_BYTES,
+};
+use crate::tree_sitter_detector::Lang;
+use serde_json::{json, Map, Value};
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::time::{Duration, Instant};
 
-/// One registered MCP tool.
-#[derive(Clone)]
-struct ToolDef {
-    name: &'static str,
-    description: &'static str,
+pub const SERVER_NAME: &str = "trace";
+
+/// Protocol revisions this server speaks, newest first. The tool surface only
+/// uses features common to all of them.
+pub const SUPPORTED_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+
+const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_millis(1500);
+
+const INSTRUCTIONS: &str = "trace is this repository's architectural memory: an always-fresh index of symbols, imports, call graph and HTTP routes; the project's architectural rules; its decision records (ADRs); and a log of past agent sessions.\n\
+Suggested workflow:\n\
+1. At session start call get_recent_history to recover context from earlier sessions.\n\
+2. Navigate with find_symbol, get_symbol_outline, find_callers/find_callees, get_imports/find_importers instead of reading whole files.\n\
+3. Before editing, call eval_plan with the files you intend to touch (optionally with proposed content) and search_decisions for the area you are changing.\n\
+4. After a significant architectural choice, call record_decision.\n\
+5. Before finishing, call record_session with a summary and the files you touched.";
+
+// ── JSON-RPC plumbing ──────────────────────────────────────────────────────────
+
+pub const PARSE_ERROR: i64 = -32700;
+pub const INVALID_REQUEST: i64 = -32600;
+pub const METHOD_NOT_FOUND: i64 = -32601;
+pub const INVALID_PARAMS: i64 = -32602;
+pub const INTERNAL_ERROR: i64 = -32603;
+
+#[derive(Debug)]
+struct RpcError {
+    code: i64,
+    message: String,
 }
 
-static TOOLS: &[ToolDef] = &[
-    ToolDef {
-        name: "get_symbol_outline",
-        description: "Return structural symbols (AST-derived) for a file.",
-    },
-    ToolDef {
-        name: "find_callers",
-        description: "Find all functions that call a given symbol across the repo.",
-    },
-    ToolDef {
-        name: "get_imports",
-        description: "Return imports/dependencies for a file.",
-    },
-    ToolDef {
-        name: "eval_plan",
-        description: "Evaluate a file-change plan against architectural rules.",
-    },
-    ToolDef {
-        name: "search_decisions",
-        description: "Search ADRs by keyword.",
-    },
-    ToolDef {
-        name: "record_decision",
-        description: "Record a new architectural decision.",
-    },
-    ToolDef {
-        name: "get_recent_history",
-        description: "Return recent session history for drift recovery.",
-    },
-    ToolDef {
-        name: "scan_repo",
-        description: "Scan a repo for structural symbols.",
-    },
-    ToolDef {
-        name: "scan_incremental",
-        description: "Incrementally re-scan only changed files.",
-    },
-];
+impl RpcError {
+    fn new(code: i64, message: impl Into<String>) -> Self {
+        RpcError {
+            code,
+            message: message.into(),
+        }
+    }
+}
 
-/// The server context, passed to every tool handler.
+/// A JSON-RPC error response.
+pub fn error_response(id: Value, code: i64, message: &str) -> Value {
+    json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
+}
+
+/// Per-connection protocol state.
+#[derive(Debug, Default, Clone)]
+pub struct Session {
+    /// Negotiated protocol version (set by `initialize`).
+    pub protocol_version: Option<String>,
+    /// `clientInfo.name` from `initialize`, used as the default agent name.
+    pub client_name: Option<String>,
+}
+
+impl Session {
+    fn at_least(&self, version: &str) -> bool {
+        self.protocol_version
+            .as_deref()
+            .is_some_and(|v| v >= version)
+    }
+}
+
+// ── Server ─────────────────────────────────────────────────────────────────────
+
+/// How eagerly [`Server::ensure_index`] refreshes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refresh {
+    /// Refresh only if the last refresh is older than the refresh interval.
+    IfStale,
+    /// Incremental refresh now.
+    Now,
+    /// Re-parse every file.
+    Full,
+}
+
+#[derive(Default)]
+struct IndexState {
+    /// The persisted index cache has been loaded into the graph.
+    cache_loaded: bool,
+    last_refresh: Option<Instant>,
+}
+
+/// The server context shared by every connection.
 pub struct Server {
-    pub store: TraceStore,
-    pub graph: StructuralGraph,
-    pub root: PathBuf,
+    root: PathBuf,
+    store: Mutex<TraceStore>,
+    graph: RwLock<StructuralGraph>,
+    index_state: Mutex<IndexState>,
+    /// At least one refresh has completed, so the graph reflects the working
+    /// tree and queries may be served while a later refresh is in flight.
+    ready: AtomicBool,
+    /// Why project tools are unavailable (root missing, or `/`/`$HOME`).
+    blocked: Option<String>,
+    refresh_interval: Duration,
+}
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn read<T>(l: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    l.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    l.write().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Open `<root>/.trace/trace.db`, keeping the state directory out of git.
+fn open_project_store(root: &Path) -> TraceStore {
+    let dir = root.join(".trace");
+    let _ = std::fs::create_dir_all(&dir);
+    let gitignore = dir.join(".gitignore");
+    if !gitignore.exists() {
+        let _ = std::fs::write(
+            &gitignore,
+            "# trace runtime state (index cache, history)\n*\n",
+        );
+    }
+    let db = dir.join("trace.db");
+    match TraceStore::open(&db) {
+        Ok(store) => store,
+        Err(e) => {
+            eprintln!(
+                "trace: cannot open {}: {e}; using an in-memory store (history will not persist)",
+                db.display()
+            );
+            TraceStore::open_in_memory().expect("in-memory SQLite must open")
+        }
+    }
 }
 
 impl Server {
     pub fn new(root: PathBuf) -> Self {
-        let db_path = root.join(".trace/trace.db");
-        let store =
-            TraceStore::open(&db_path).unwrap_or_else(|_| TraceStore::open_in_memory().unwrap());
-        Self {
-            store,
-            graph: StructuralGraph::new(),
+        let root = root.canonicalize().unwrap_or(root);
+        let blocked = if !root.is_dir() {
+            Some(format!(
+                "project root {} does not exist or is not a directory",
+                root.display()
+            ))
+        } else if is_broad_root(&root) && std::env::var_os("TRACE_ALLOW_BROAD_ROOT").is_none() {
+            Some(format!(
+                "refusing to operate on {}: it is the filesystem root or your home directory, not a project. \
+                 Start trace from inside a project or pass one explicitly: `trace serve /path/to/project` \
+                 (set TRACE_ALLOW_BROAD_ROOT=1 to override).",
+                root.display()
+            ))
+        } else {
+            None
+        };
+        let store = if blocked.is_none() {
+            open_project_store(&root)
+        } else {
+            TraceStore::open_in_memory().expect("in-memory SQLite must open")
+        };
+        let refresh_interval = std::env::var("TRACE_REFRESH_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_REFRESH_INTERVAL);
+        Server {
             root,
+            store: Mutex::new(store),
+            graph: RwLock::new(StructuralGraph::new()),
+            index_state: Mutex::new(IndexState::default()),
+            ready: AtomicBool::new(false),
+            blocked,
+            refresh_interval,
         }
     }
 
-    /// Process a single JSON-RPC request and return the response string.
-    /// Returns None for notifications (methods that don't receive a response,
-    /// e.g. "initialized").
-    pub fn process_request(&self, req: &JsonRpcRequest) -> Option<String> {
-        let id = req.id.clone().unwrap_or(json!(null));
-        let params = req.params.clone().unwrap_or_default();
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 
-        let resp = match req.method.as_str() {
-            "initialize" => {
-                json!({
-                    "jsonrpc": "2.0",
-                    "id": id,
-                    "result": {
-                        "protocolVersion": "0.1",
-                        "capabilities": { "tools": {} },
-                    }
-                })
+    /// Why project tools are unavailable, if they are.
+    pub fn blocked_reason(&self) -> Option<&str> {
+        self.blocked.as_deref()
+    }
+
+    /// Bring the structural index up to date. Returns the scan statistics
+    /// when a refresh ran, `None` when the index was fresh enough (or another
+    /// refresh was already in flight and the current graph is served).
+    pub fn ensure_index(&self, mode: Refresh) -> Result<Option<ScanStats>, String> {
+        if let Some(reason) = &self.blocked {
+            return Err(reason.clone());
+        }
+        let mut state = if mode == Refresh::IfStale && self.ready.load(Ordering::SeqCst) {
+            match self.index_state.try_lock() {
+                Ok(guard) => guard,
+                Err(TryLockError::WouldBlock) => return Ok(None),
+                Err(TryLockError::Poisoned(p)) => p.into_inner(),
             }
-            "initialized" => return None, // notification — no response
-            "tools/list" => {
-                let tools: Vec<Value> = TOOLS
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                            },
-                        })
-                    })
+        } else {
+            lock(&self.index_state)
+        };
+        if mode == Refresh::IfStale
+            && state
+                .last_refresh
+                .is_some_and(|t| t.elapsed() < self.refresh_interval)
+        {
+            return Ok(None);
+        }
+        if !state.cache_loaded {
+            let cached = lock(&self.store).load_index().unwrap_or_else(|e| {
+                eprintln!("trace: ignoring unreadable index cache: {e}");
+                Vec::new()
+            });
+            write(&self.graph).files = cached.into_iter().collect();
+            state.cache_loaded = true;
+        }
+        let changes = {
+            let graph = read(&self.graph);
+            scan::compute_changes(&graph, &self.root, mode == Refresh::Full)
+        };
+        if !changes.is_empty() {
+            if let Err(e) = lock(&self.store).save_index_changes(
+                &changes.upserts,
+                &changes.touched,
+                &changes.removed,
+            ) {
+                eprintln!("trace: failed to persist index changes: {e}");
+            }
+        }
+        let stats = changes.stats.clone();
+        changes.apply(&mut write(&self.graph));
+        state.last_refresh = Some(Instant::now());
+        self.ready.store(true, Ordering::SeqCst);
+        Ok(Some(stats))
+    }
+
+    /// Statistics over the in-memory graph (no refresh).
+    pub fn index_stats(&self) -> crate::structural::GraphStats {
+        read(&self.graph).stats()
+    }
+
+    /// (files in the persisted index cache, recorded sessions).
+    pub fn store_counts(&self) -> (usize, usize) {
+        let store = lock(&self.store);
+        (
+            store.index_size().unwrap_or(0),
+            store.session_count().unwrap_or(0),
+        )
+    }
+
+    /// A fresh-enough read view of the graph.
+    fn graph(&self) -> Result<RwLockReadGuard<'_, StructuralGraph>, String> {
+        self.ensure_index(Refresh::IfStale)?;
+        Ok(read(&self.graph))
+    }
+
+    /// Handle one raw JSON-RPC message (a request, a notification, or a
+    /// batch). Returns the serialised response, or `None` when nothing must
+    /// be sent back.
+    pub fn handle_message(&self, session: &mut Session, raw: &str) -> Option<String> {
+        let value: Value = match serde_json::from_str(raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return Some(
+                    error_response(Value::Null, PARSE_ERROR, &format!("Parse error: {e}"))
+                        .to_string(),
+                )
+            }
+        };
+        match value {
+            Value::Array(items) => {
+                if items.is_empty() {
+                    return Some(
+                        error_response(
+                            Value::Null,
+                            INVALID_REQUEST,
+                            "Invalid Request: empty batch",
+                        )
+                        .to_string(),
+                    );
+                }
+                let responses: Vec<Value> = items
+                    .into_iter()
+                    .filter_map(|item| self.handle_value(session, item))
                     .collect();
-                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
+                (!responses.is_empty()).then(|| Value::Array(responses).to_string())
             }
-            "tools/call" => {
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = params
-                    .get("arguments")
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                match dispatch(tool_name) {
-                    Some(handler) => match handler(self, &args) {
-                        Ok(result) => {
-                            let content = json!([{ "type": "text", "text": result.to_string() }]);
-                            json!({
-                                "jsonrpc": "2.0",
-                                "id": id,
-                                "result": { "content": content }
-                            })
-                        }
-                        Err(e) => json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "error": { "code": -32000, "message": e.to_string() }
-                        }),
+            other => self.handle_value(session, other).map(|v| v.to_string()),
+        }
+    }
+
+    fn handle_value(&self, session: &mut Session, msg: Value) -> Option<Value> {
+        let Value::Object(obj) = msg else {
+            return Some(error_response(
+                Value::Null,
+                INVALID_REQUEST,
+                "Invalid Request: expected an object",
+            ));
+        };
+        let id = obj.get("id").cloned();
+        let params = obj.get("params").cloned().unwrap_or(Value::Null);
+        let Some(method) = obj.get("method").and_then(Value::as_str) else {
+            if obj.contains_key("result") || obj.contains_key("error") {
+                return None; // a response to a request we never send
+            }
+            return Some(error_response(
+                id.unwrap_or(Value::Null),
+                INVALID_REQUEST,
+                "Invalid Request: missing method",
+            ));
+        };
+        let Some(id) = id else {
+            // Notification: never answered. (`notifications/initialized`,
+            // `notifications/cancelled`, ... need no action.)
+            return None;
+        };
+        if !(id.is_string() || id.is_number()) {
+            return Some(error_response(
+                Value::Null,
+                INVALID_REQUEST,
+                "Invalid Request: id must be a string or number",
+            ));
+        }
+        Some(match self.handle_request(session, method, &params) {
+            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
+            Err(e) => error_response(id, e.code, &e.message),
+        })
+    }
+
+    fn handle_request(
+        &self,
+        session: &mut Session,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, RpcError> {
+        match method {
+            "initialize" => {
+                let requested = params.get("protocolVersion").and_then(Value::as_str);
+                let version = requested
+                    .filter(|v| SUPPORTED_PROTOCOL_VERSIONS.contains(v))
+                    .unwrap_or(SUPPORTED_PROTOCOL_VERSIONS[0]);
+                session.protocol_version = Some(version.to_string());
+                session.client_name = params
+                    .pointer("/clientInfo/name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let mut instructions = INSTRUCTIONS.to_string();
+                if let Some(reason) = &self.blocked {
+                    instructions = format!("WARNING: {reason}\n\n{instructions}");
+                }
+                Ok(json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": {
+                        "name": SERVER_NAME,
+                        "title": "trace — architectural memory engine",
+                        "version": env!("CARGO_PKG_VERSION"),
                     },
-                    None => json!({
-                        "jsonrpc": "2.0",
-                        "id": id,
-                        "error": { "code": -32601, "message": format!("unknown tool: {}", tool_name) }
-                    }),
-                }
+                    "instructions": instructions,
+                }))
             }
-            _ => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("method not found: {}", req.method),
-                }
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(
+                json!({ "tools": TOOLS.iter().map(|t| t.describe(session)).collect::<Vec<_>>() }),
+            ),
+            "tools/call" => {
+                let name = params.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    RpcError::new(INVALID_PARAMS, "tools/call requires a string 'name'")
+                })?;
+                let empty = Map::new();
+                let args = match params.get("arguments") {
+                    None | Some(Value::Null) => &empty,
+                    Some(Value::Object(map)) => map,
+                    Some(_) => {
+                        return Err(RpcError::new(
+                            INVALID_PARAMS,
+                            "'arguments' must be an object",
+                        ))
+                    }
+                };
+                let tool = TOOLS.iter().find(|t| t.name == name).ok_or_else(|| {
+                    RpcError::new(INVALID_PARAMS, format!("Unknown tool: {name}"))
+                })?;
+                Ok(self.call_tool(tool, session, args))
+            }
+            "resources/list" => Ok(json!({ "resources": [] })),
+            "resources/templates/list" => Ok(json!({ "resourceTemplates": [] })),
+            "prompts/list" => Ok(json!({ "prompts": [] })),
+            _ => Err(RpcError::new(
+                METHOD_NOT_FOUND,
+                format!("Method not found: {method}"),
+            )),
+        }
+    }
+
+    fn call_tool(&self, tool: &ToolSpec, session: &Session, args: &Map<String, Value>) -> Value {
+        let outcome = match &self.blocked {
+            Some(reason) => Err(reason.clone()),
+            None => catch_unwind(AssertUnwindSafe(|| {
+                (tool.handler)(self, session, &Args(args))
+            }))
+            .unwrap_or_else(|panic| {
+                let msg = panic
+                    .downcast_ref::<String>()
+                    .cloned()
+                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                    .unwrap_or_else(|| "unknown panic".into());
+                Err(format!("internal error in {}: {msg}", tool.name))
             }),
         };
-
-        Some(resp.to_string())
+        match outcome {
+            Ok(value) => {
+                let mut result = json!({
+                    "content": [{ "type": "text", "text": value.to_string() }],
+                    "isError": false,
+                });
+                if session.at_least("2025-06-18") && value.is_object() {
+                    result["structuredContent"] = value;
+                }
+                result
+            }
+            Err(message) => json!({
+                "content": [{ "type": "text", "text": message }],
+                "isError": true,
+            }),
+        }
     }
 }
 
-/// A tool handler: takes args, returns JSON.
-type Handler = fn(&Server, &serde_json::Map<String, Value>) -> io::Result<Value>;
+// ── Tool registry ──────────────────────────────────────────────────────────────
 
-/// Dispatch table mapping tool name → handler.
-fn dispatch(name: &str) -> Option<Handler> {
-    match name {
-        "get_symbol_outline" => Some(handle_symbol_outline),
-        "find_callers" => Some(handle_find_callers),
-        "get_imports" => Some(handle_imports),
-        "eval_plan" => Some(handle_eval_plan),
-        "search_decisions" => Some(handle_search_decisions),
-        "record_decision" => Some(handle_record_decision),
-        "get_recent_history" => Some(handle_recent_history),
-        "scan_repo" => Some(handle_scan_repo),
-        "scan_incremental" => Some(handle_scan_incremental),
-        _ => None,
+type ToolResult = Result<Value, String>;
+type Handler = fn(&Server, &Session, &Args) -> ToolResult;
+
+struct ToolSpec {
+    name: &'static str,
+    title: &'static str,
+    description: &'static str,
+    read_only: bool,
+    idempotent: bool,
+    schema: fn() -> Value,
+    handler: Handler,
+}
+
+impl ToolSpec {
+    fn describe(&self, session: &Session) -> Value {
+        let mut tool = json!({
+            "name": self.name,
+            "description": self.description,
+            "inputSchema": (self.schema)(),
+        });
+        if session.at_least("2025-06-18") {
+            tool["title"] = json!(self.title);
+        }
+        if session.at_least("2025-03-26") {
+            tool["annotations"] = json!({
+                "title": self.title,
+                "readOnlyHint": self.read_only,
+                "destructiveHint": false,
+                "idempotentHint": self.idempotent,
+                "openWorldHint": false,
+            });
+        }
+        tool
     }
 }
 
-/// Phase 1: get_symbol_outline(path)
-fn handle_symbol_outline(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let abs = s.root.join(path);
-    let text =
-        std::fs::read_to_string(&abs).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
-    let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
-    if !is_scannable_ext(ext) {
-        return Ok(json!({
-            "symbols": [],
-            "file": path,
-            "error": format!("unsupported extension: {ext}")
-        }));
+static TOOLS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "get_symbol_outline",
+        title: "Symbol outline",
+        description: "Outline of one source file: every class/struct/trait/interface/function/method/constant with kind, parent, line span, visibility and signature. Much cheaper than reading the file.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_outline,
+        handler: tool_outline,
+    },
+    ToolSpec {
+        name: "find_symbol",
+        title: "Find symbol",
+        description: "Search symbol definitions across the repository by name (exact, prefix, substring or fuzzy; `Type::method`/`Class.method` for qualified names). Returns file, line and signature.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_find_symbol,
+        handler: tool_find_symbol,
+    },
+    ToolSpec {
+        name: "find_callers",
+        title: "Find callers",
+        description: "Every call site of a function or method across the repository, with the calling function, file and line. Qualify the name (`Store::open`, `Service.run`) to drop calls through other types.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_find_callers,
+        handler: tool_find_callers,
+    },
+    ToolSpec {
+        name: "find_callees",
+        title: "Find callees",
+        description: "Everything a function or method calls, with lines and where each callee is defined.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_find_callees,
+        handler: tool_find_callees,
+    },
+    ToolSpec {
+        name: "get_imports",
+        title: "Get imports",
+        description: "Imports of one source file, with line numbers and the repository file each import resolves to.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_path_only,
+        handler: tool_imports,
+    },
+    ToolSpec {
+        name: "find_importers",
+        title: "Find importers",
+        description: "Reverse dependencies: files importing a repository file/directory (resolved imports) or a module name (`crate::db`, `react`, `os.path`).",
+        read_only: true,
+        idempotent: true,
+        schema: schema_find_importers,
+        handler: tool_find_importers,
+    },
+    ToolSpec {
+        name: "list_routes",
+        title: "List HTTP routes",
+        description: "HTTP routes declared in the codebase (Axum, Actix, Rocket, Express, Fastify, NestJS, Next.js, FastAPI, Flask, Django, net/http, Gin, Echo, Chi, Spring, JAX-RS) with method, path, handler and location.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_list_routes,
+        handler: tool_list_routes,
+    },
+    ToolSpec {
+        name: "eval_plan",
+        title: "Evaluate change plan",
+        description: "Check files you intend to create or modify against the project's architectural rules (.architectural-rules.json/.yaml or trace.toml). Pass paths, or {path, content} objects to check proposed content. Returns violations and whether the plan is allowed.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_eval_plan,
+        handler: tool_eval_plan,
+    },
+    ToolSpec {
+        name: "list_rules",
+        title: "List architectural rules",
+        description: "The project's architectural rules, optionally only those applying to one path.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_list_rules,
+        handler: tool_list_rules,
+    },
+    ToolSpec {
+        name: "search_decisions",
+        title: "Search decisions",
+        description: "Relevance-ranked search of Architecture Decision Records (title, tags, context, decision, consequences). Omit the query to list all. Check before changing an established pattern.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_search_decisions,
+        handler: tool_search_decisions,
+    },
+    ToolSpec {
+        name: "record_decision",
+        title: "Record decision",
+        description: "Record a new Architecture Decision Record as Markdown in the project's ADR directory. Use `supersedes` to replace an earlier decision (it is marked Superseded).",
+        read_only: false,
+        idempotent: false,
+        schema: schema_record_decision,
+        handler: tool_record_decision,
+    },
+    ToolSpec {
+        name: "record_session",
+        title: "Record session",
+        description: "Log what this session did — a summary plus the files touched and why — so later sessions can recover context. Calling again with the same session_id updates it.",
+        read_only: false,
+        idempotent: false,
+        schema: schema_record_session,
+        handler: tool_record_session,
+    },
+    ToolSpec {
+        name: "get_recent_history",
+        title: "Recent session history",
+        description: "Most recent agent sessions (summary, agent, age, touched files) — call at session start to recover context after a reset or compaction.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_recent_history,
+        handler: tool_recent_history,
+    },
+    ToolSpec {
+        name: "get_file_history",
+        title: "File history",
+        description: "Past sessions that touched a file, with the recorded reason for each change.",
+        read_only: true,
+        idempotent: true,
+        schema: schema_file_history,
+        handler: tool_file_history,
+    },
+    ToolSpec {
+        name: "scan_repo",
+        title: "Rebuild index",
+        description: "Rebuild the structural index from scratch (re-parse every file). Rarely needed: the index refreshes itself incrementally before every query.",
+        read_only: false,
+        idempotent: true,
+        schema: schema_empty,
+        handler: tool_scan_repo,
+    },
+    ToolSpec {
+        name: "scan_incremental",
+        title: "Refresh index",
+        description: "Refresh the structural index now, re-parsing only files that changed. Returns index statistics.",
+        read_only: false,
+        idempotent: true,
+        schema: schema_empty,
+        handler: tool_scan_incremental,
+    },
+];
+
+/// Names of all tools, in registration order.
+pub fn tool_names() -> Vec<&'static str> {
+    TOOLS.iter().map(|t| t.name).collect()
+}
+
+// ── Schemas ────────────────────────────────────────────────────────────────────
+
+fn schema_empty() -> Value {
+    json!({ "type": "object", "properties": {}, "additionalProperties": false })
+}
+
+fn path_prop(what: &str) -> Value {
+    json!({ "type": "string", "description": format!("{what} — relative to the project root (absolute paths inside the project are accepted)") })
+}
+
+fn limit_prop(default: usize, max: usize) -> Value {
+    json!({ "type": "integer", "minimum": 1, "maximum": max, "default": default, "description": "Maximum results to return" })
+}
+
+fn kind_prop() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["module", "class", "struct", "enum", "interface", "trait", "function", "method", "constant", "variable", "type_alias", "macro"],
+    })
+}
+
+fn schema_path_only() -> Value {
+    json!({ "type": "object", "properties": { "path": path_prop("Source file") }, "required": ["path"] })
+}
+
+fn schema_outline() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "path": path_prop("Source file"),
+            "kinds": { "type": "array", "items": kind_prop(), "description": "Only these symbol kinds" },
+        },
+        "required": ["path"],
+    })
+}
+
+fn schema_find_symbol() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Symbol name, prefix, fragment, or qualified name (Type::method / Class.method)" },
+            "kind": kind_prop(),
+            "exported_only": { "type": "boolean", "default": false, "description": "Only public/exported symbols" },
+            "path_prefix": { "type": "string", "description": "Only symbols in files under this path" },
+            "limit": limit_prop(20, 200),
+        },
+        "required": ["query"],
+    })
+}
+
+fn schema_find_callers() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Function/method name, optionally qualified (Store::open, Service.run)" },
+            "limit": limit_prop(50, 500),
+        },
+        "required": ["symbol"],
+    })
+}
+
+fn schema_find_callees() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "symbol": { "type": "string", "description": "Function/method name, optionally qualified" },
+            "file": path_prop("Only callers defined in this file"),
+            "limit": limit_prop(100, 500),
+        },
+        "required": ["symbol"],
+    })
+}
+
+fn schema_find_importers() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "target": { "type": "string", "description": "Repository file or directory path, or a module name" },
+            "limit": limit_prop(100, 1000),
+        },
+        "required": ["target"],
+    })
+}
+
+fn schema_list_routes() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "method": { "type": "string", "description": "HTTP method filter (GET, POST, ...)" },
+            "path_contains": { "type": "string", "description": "Substring the route path must contain" },
+            "file_prefix": { "type": "string", "description": "Only routes declared in files under this path" },
+            "limit": limit_prop(200, 2000),
+        },
+    })
+}
+
+fn schema_eval_plan() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "files_to_touch": {
+                "type": "array",
+                "description": "Files to create or modify: a path (current content is checked), or {path, content} with the proposed content",
+                "items": {
+                    "anyOf": [
+                        { "type": "string" },
+                        {
+                            "type": "object",
+                            "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                            "required": ["path"],
+                        },
+                    ],
+                },
+                "minItems": 1,
+            },
+        },
+        "required": ["files_to_touch"],
+    })
+}
+
+fn schema_list_rules() -> Value {
+    json!({ "type": "object", "properties": { "path": path_prop("Only rules applying to this file") } })
+}
+
+fn schema_search_decisions() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string", "description": "Keywords or an ADR number; omit to list all" },
+            "status": { "type": "string", "enum": ["proposed", "accepted", "superseded", "deprecated", "rejected", "retired"] },
+            "limit": limit_prop(10, 100),
+            "include_body": { "type": "boolean", "default": true, "description": "Include context/decision/consequences text" },
+        },
+    })
+}
+
+fn schema_record_decision() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "title": { "type": "string", "description": "Short imperative title, e.g. 'Use SQLite for local state'" },
+            "context": { "type": "string", "description": "The forces and problem motivating the decision" },
+            "decision": { "type": "string", "description": "What was decided" },
+            "consequences": { "type": "string", "description": "Resulting trade-offs, follow-ups, risks" },
+            "status": { "type": "string", "enum": ["proposed", "accepted", "deprecated", "rejected"], "default": "accepted" },
+            "tags": { "type": "array", "items": { "type": "string" } },
+            "supersedes": { "type": "string", "description": "Number of the ADR this replaces (e.g. '3' or '0003')" },
+        },
+        "required": ["title", "decision"],
+    })
+}
+
+fn schema_record_session() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string", "description": "What was done and why, including open follow-ups" },
+            "agent_name": { "type": "string", "description": "Defaults to the MCP client's name" },
+            "session_id": { "type": "string", "description": "Reuse to update an earlier record; generated when omitted" },
+            "touched_files": {
+                "type": "array",
+                "items": {
+                    "anyOf": [
+                        { "type": "string" },
+                        {
+                            "type": "object",
+                            "properties": { "path": { "type": "string" }, "reason": { "type": "string" } },
+                            "required": ["path"],
+                        },
+                    ],
+                },
+            },
+        },
+        "required": ["summary"],
+    })
+}
+
+fn schema_recent_history() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "limit": limit_prop(10, 100),
+            "agent_name": { "type": "string", "description": "Only sessions from this agent" },
+            "include_files": { "type": "boolean", "default": true },
+        },
+    })
+}
+
+fn schema_file_history() -> Value {
+    json!({
+        "type": "object",
+        "properties": { "path": path_prop("File"), "limit": limit_prop(20, 200) },
+        "required": ["path"],
+    })
+}
+
+// ── Argument access ────────────────────────────────────────────────────────────
+
+struct Args<'a>(&'a Map<String, Value>);
+
+impl<'a> Args<'a> {
+    fn get(&self, key: &str) -> Option<&'a Value> {
+        self.0.get(key).filter(|v| !v.is_null())
     }
-    let (symbols, _imports, _routes) = extract_file(&abs.to_string_lossy(), ext, &text);
-    let syms: Vec<Value> = symbols
-        .iter()
-        .map(|sym| {
-            json!({
-                "name": sym.name,
-                "kind": sym.kind,
-                "line": sym.line,
-                "observation_source": sym.observation_source,
-            })
-        })
-        .collect();
-    Ok(json!({ "symbols": syms, "file": path }))
-}
 
-/// Phase 1: find_callers(symbol)
-fn handle_find_callers(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let symbol = args.get("symbol").and_then(|v| v.as_str()).unwrap_or("");
-    let callers = s.graph.find_callers(symbol);
-    let result: Vec<Value> = callers
-        .iter()
-        .map(|e| {
-            json!({
-                "caller": e.caller,
-                "from_file": e.from_file,
-            })
-        })
-        .collect();
-    Ok(json!({ "symbol": symbol, "callers": result }))
-}
+    fn str(&self, key: &str) -> Result<Option<&'a str>, String> {
+        match self.get(key) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.as_str())),
+            Some(_) => Err(format!("argument '{key}' must be a string")),
+        }
+    }
 
-/// Phase 1: get_imports(path)
-fn handle_imports(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
-    let abs = s.root.join(path);
-    let text =
-        std::fs::read_to_string(&abs).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
-    let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
-    let (_symbols, imports, _routes) = extract_file(&abs.to_string_lossy(), ext, &text);
-    let result: Vec<Value> = imports
-        .iter()
-        .map(|imp| {
-            json!({
-                "from_file": imp.from_file,
-                "to_module": imp.to_module,
-                "names": imp.names,
-            })
-        })
-        .collect();
-    Ok(json!({ "imports": result, "file": path }))
-}
+    /// A string argument, with blank values treated as absent.
+    fn opt_str(&self, key: &str) -> Result<Option<&'a str>, String> {
+        Ok(self.str(key)?.filter(|s| !s.trim().is_empty()))
+    }
 
-/// Phase 2: eval_plan(files_to_touch)
-fn handle_eval_plan(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let files = args
-        .get("files_to_touch")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| {
-                    let rel = v.as_str().unwrap_or("");
-                    let content = std::fs::read_to_string(s.root.join(rel)).ok()?;
-                    Some((rel.to_string(), content))
+    fn required_str(&self, key: &str) -> Result<&'a str, String> {
+        self.opt_str(key)?
+            .ok_or_else(|| format!("missing required argument '{key}'"))
+    }
+
+    fn limit(&self, key: &str, default: usize, max: usize) -> Result<usize, String> {
+        let n = match self.get(key) {
+            None => return Ok(default),
+            Some(Value::Number(n)) => n.as_f64().unwrap_or(default as f64),
+            Some(Value::String(s)) => s
+                .trim()
+                .parse::<f64>()
+                .map_err(|_| format!("argument '{key}' must be a number"))?,
+            Some(_) => return Err(format!("argument '{key}' must be a number")),
+        };
+        if n < 1.0 {
+            return Err(format!("argument '{key}' must be at least 1"));
+        }
+        Ok((n as usize).min(max))
+    }
+
+    fn bool(&self, key: &str, default: bool) -> Result<bool, String> {
+        match self.get(key) {
+            None => Ok(default),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(Value::String(s)) => match s.trim().to_ascii_lowercase().as_str() {
+                "true" | "yes" | "1" => Ok(true),
+                "false" | "no" | "0" => Ok(false),
+                _ => Err(format!("argument '{key}' must be a boolean")),
+            },
+            Some(_) => Err(format!("argument '{key}' must be a boolean")),
+        }
+    }
+
+    /// An array of strings (a single string is accepted as a one-element list).
+    fn string_list(&self, key: &str) -> Result<Vec<String>, String> {
+        match self.get(key) {
+            None => Ok(Vec::new()),
+            Some(Value::String(s)) => Ok(vec![s.clone()]),
+            Some(Value::Array(items)) => items
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("argument '{key}' must contain only strings"))
                 })
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+                .collect(),
+            Some(_) => Err(format!("argument '{key}' must be an array of strings")),
+        }
+    }
 
-    let result = eval_plan(&s.root, &files);
-    let vios: Vec<Value> = result
-        .violations
+    fn kind(&self, key: &str) -> Result<Option<SymbolKind>, String> {
+        self.opt_str(key)?
+            .map(|k| SymbolKind::parse(k).ok_or_else(|| format!("unknown symbol kind '{k}'")))
+            .transpose()
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────────
+
+fn read_source(abs: &Path, rel: &str) -> Result<String, String> {
+    let meta = std::fs::metadata(abs).map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => format!("file not found: {rel}"),
+        _ => format!("cannot read {rel}: {e}"),
+    })?;
+    if !meta.is_file() {
+        return Err(format!("{rel} is not a file"));
+    }
+    if meta.len() > MAX_FILE_BYTES {
+        return Err(format!(
+            "{rel} is larger than {MAX_FILE_BYTES} bytes and is not analysed"
+        ));
+    }
+    let bytes = std::fs::read(abs).map_err(|e| format!("cannot read {rel}: {e}"))?;
+    Ok(String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
+}
+
+fn source_lang(rel: &str) -> Result<Lang, String> {
+    Lang::from_path(rel).ok_or_else(|| {
+        let exts: Vec<&str> = crate::tree_sitter_detector::supported_extensions().collect();
+        format!(
+            "unsupported file type: {rel} (supported extensions: {})",
+            exts.join(", ")
+        )
+    })
+}
+
+fn symbol_json(sym: &Symbol, with_file: bool) -> Value {
+    let mut m = Map::new();
+    m.insert("name".into(), json!(sym.name));
+    m.insert("kind".into(), json!(sym.kind));
+    if let Some(parent) = &sym.parent {
+        m.insert("parent".into(), json!(parent));
+        m.insert("qualified_name".into(), json!(sym.qualified_name()));
+    }
+    if with_file {
+        m.insert("file".into(), json!(sym.file));
+    }
+    m.insert("line".into(), json!(sym.line));
+    if sym.end_line > sym.line {
+        m.insert("end_line".into(), json!(sym.end_line));
+    }
+    m.insert("exported".into(), json!(sym.exported));
+    if !sym.signature.is_empty() {
+        m.insert("signature".into(), json!(sym.signature));
+    }
+    Value::Object(m)
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> Value {
+    if text.chars().count() <= max_chars {
+        json!(text)
+    } else {
+        json!(format!(
+            "{}…",
+            text.chars().take(max_chars).collect::<String>()
+        ))
+    }
+}
+
+static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `20260922T143015-3fa9c2b1d0` — sortable; 40 random-ish bits per second
+/// keep concurrent agents from colliding.
+fn generate_session_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mix = scan::content_hash(
+        format!(
+            "{nanos}-{}-{}",
+            std::process::id(),
+            SESSION_COUNTER.fetch_add(1, Ordering::Relaxed)
+        )
+        .as_bytes(),
+    );
+    format!(
+        "{}-{:010x}",
+        chrono::Local::now().format("%Y%m%dT%H%M%S"),
+        mix & 0xff_ffff_ffff
+    )
+}
+
+// ── Phase 1 handlers ───────────────────────────────────────────────────────────
+
+fn tool_outline(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let path = a.required_str("path")?;
+    let resolved = resolve_in_root(&s.root, path)?;
+    let lang = source_lang(&resolved.rel)?;
+    let text = read_source(&resolved.abs, &resolved.rel)?;
+    let kinds: Vec<SymbolKind> = a
+        .string_list("kinds")?
         .iter()
-        .map(|v| {
-            json!({
-                "rule_id": v.rule_id,
-                "severity": v.severity,
-                "message": v.message,
-                "file": v.file,
-                "detail": v.detail,
-            })
+        .map(|k| SymbolKind::parse(k).ok_or_else(|| format!("unknown symbol kind '{k}'")))
+        .collect::<Result<_, _>>()?;
+    let facts = extract_with_lang(&resolved.rel, lang, &text);
+    let symbols: Vec<Value> = facts
+        .symbols
+        .iter()
+        .filter(|sym| kinds.is_empty() || kinds.contains(&sym.kind))
+        .map(|sym| symbol_json(sym, false))
+        .collect();
+    let mut out = json!({
+        "file": resolved.rel,
+        "language": lang.name(),
+        "lines": text.lines().count(),
+        "symbols": symbols,
+    });
+    if facts.has_parse_errors {
+        out["parse_errors"] = json!(true);
+    }
+    Ok(out)
+}
+
+fn tool_find_symbol(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let query = a.str("query")?.unwrap_or("").trim();
+    let kind = a.kind("kind")?;
+    let path_prefix = a.opt_str("path_prefix")?.map(crate::model::normalize_rel);
+    if query.is_empty() && kind.is_none() && path_prefix.is_none() {
+        return Err("provide a 'query' (or 'kind'/'path_prefix' to list symbols)".into());
+    }
+    let limit = a.limit("limit", 20, 200)?;
+    let graph = s.graph()?;
+    let hits = graph.find_symbols(&SymbolQuery {
+        text: query,
+        kind,
+        exported_only: a.bool("exported_only", false)?,
+        path_prefix: path_prefix.as_deref(),
+        limit: 0,
+    });
+    let total = hits.len();
+    let symbols: Vec<Value> = hits
+        .iter()
+        .take(limit)
+        .map(|(sym, _)| symbol_json(sym, true))
+        .collect();
+    Ok(json!({ "query": query, "total": total, "truncated": total > limit, "symbols": symbols }))
+}
+
+fn tool_find_callers(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let symbol = a.required_str("symbol")?.trim();
+    let limit = a.limit("limit", 50, 500)?;
+    let graph = s.graph()?;
+    let mut callers = graph.find_callers(symbol);
+    let rank = |m: CallMatch| match m {
+        CallMatch::Exact => 0,
+        CallMatch::Name => 1,
+        CallMatch::Possible => 2,
+    };
+    callers.sort_by(|(ea, ma), (eb, mb)| {
+        rank(*ma)
+            .cmp(&rank(*mb))
+            .then_with(|| ea.from_file.cmp(&eb.from_file))
+            .then_with(|| ea.line.cmp(&eb.line))
+    });
+    let total = callers.len();
+    let definitions: Vec<Value> = graph
+        .definitions(symbol)
+        .into_iter()
+        .take(10)
+        .map(|d| json!({ "qualified_name": d.qualified_name(), "kind": d.kind, "file": d.file, "line": d.line }))
+        .collect();
+    let items: Vec<Value> = callers
+        .iter()
+        .take(limit)
+        .map(|(e, m)| {
+            let mut v =
+                json!({ "caller": e.caller, "file": e.from_file, "line": e.line, "confidence": m });
+            if let Some(q) = &e.qualifier {
+                v["via"] = json!(q);
+            }
+            v
         })
         .collect();
-
+    let files: HashSet<&str> = callers.iter().map(|(e, _)| &*e.from_file).collect();
     Ok(json!({
-        "violations": vios,
-        "errors": result.errors,
-        "warnings": result.warnings,
-        "allowed": result.allowed,
+        "symbol": symbol,
+        "total": total,
+        "files": files.len(),
+        "truncated": total > limit,
+        "definitions": definitions,
+        "callers": items,
     }))
 }
 
-/// Phase 3: search_decisions(query)
-fn handle_search_decisions(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let query = args.get("query").and_then(|v| v.as_str()).unwrap_or("");
-    let results = search_decisions(&s.root, query);
-    let decs: Vec<Value> = results
+fn tool_find_callees(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let symbol = a.required_str("symbol")?.trim();
+    let limit = a.limit("limit", 100, 500)?;
+    let file = a
+        .opt_str("file")?
+        .map(|f| resolve_in_root(&s.root, f).map(|r| r.rel))
+        .transpose()?;
+    let graph = s.graph()?;
+    let edges = graph.find_callees(symbol, file.as_deref());
+    // One pass over the symbol table, then per-edge receiver-aware matching.
+    let wanted: HashSet<&str> = edges.iter().map(|e| e.callee.as_str()).collect();
+    let mut by_name: HashMap<&str, Vec<&Symbol>> = HashMap::new();
+    for sym in graph.symbols().filter(|s| wanted.contains(s.name.as_str())) {
+        by_name.entry(sym.name.as_str()).or_default().push(sym);
+    }
+    let total = edges.len();
+    let items: Vec<Value> = edges
         .iter()
-        .map(|r| {
-            json!({
+        .take(limit)
+        .map(|e| {
+            let mut v = json!({ "callee": e.callee, "caller": e.caller, "file": e.from_file, "line": e.line });
+            if let Some(q) = &e.qualifier {
+                v["via"] = json!(q);
+            }
+            let candidates = by_name.get(e.callee.as_str()).map(Vec::as_slice).unwrap_or(&[]);
+            let targets: Vec<String> = call_targets(e, candidates)
+                .iter()
+                .take(3)
+                .map(|t| format!("{}:{}", t.file, t.line))
+                .collect();
+            if !targets.is_empty() {
+                v["defined_at"] = json!(targets);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "symbol": symbol, "total": total, "truncated": total > limit, "callees": items }))
+}
+
+fn tool_imports(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let path = a.required_str("path")?;
+    let resolved = resolve_in_root(&s.root, path)?;
+    let lang = source_lang(&resolved.rel)?;
+    let text = read_source(&resolved.abs, &resolved.rel)?;
+    let facts = extract_with_lang(&resolved.rel, lang, &text);
+    let graph = s.graph()?;
+    let resolver = Resolver::new(&graph);
+    let imports: Vec<Value> = facts
+        .imports
+        .iter()
+        .map(|imp| {
+            let mut v = json!({ "module": imp.to_module, "line": imp.line });
+            if !imp.names.is_empty() {
+                v["names"] = json!(imp.names);
+            }
+            if let Some(target) = resolver.resolve(imp) {
+                v["resolved"] = json!(target);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "file": resolved.rel, "language": lang.name(), "imports": imports }))
+}
+
+fn tool_find_importers(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let raw = a.required_str("target")?.trim();
+    let limit = a.limit("limit", 100, 1000)?;
+    let graph = s.graph()?;
+    // Prefer a repository path when the target names one.
+    let target = resolve_in_root(&s.root, raw)
+        .ok()
+        .map(|r| r.rel)
+        .filter(|rel| {
+            !rel.is_empty()
+                && (graph.files.contains_key(rel)
+                    || graph
+                        .files
+                        .range(format!("{rel}/")..)
+                        .next()
+                        .is_some_and(|(k, _)| k.starts_with(&format!("{rel}/"))))
+        })
+        .unwrap_or_else(|| raw.to_string());
+    let mut hits = graph.find_importers(&target);
+    hits.sort_by(|a, b| {
+        a.import
+            .from_file
+            .cmp(&b.import.from_file)
+            .then_with(|| a.import.line.cmp(&b.import.line))
+    });
+    let total = hits.len();
+    let items: Vec<Value> = hits
+        .iter()
+        .take(limit)
+        .map(|h| {
+            let mut v = json!({ "file": h.import.from_file, "line": h.import.line, "module": h.import.to_module });
+            if !h.import.names.is_empty() {
+                v["names"] = json!(h.import.names);
+            }
+            if let Some(r) = &h.resolved {
+                v["resolved"] = json!(r);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "target": target, "total": total, "truncated": total > limit, "importers": items }))
+}
+
+fn tool_list_routes(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let method = a.opt_str("method")?.map(|m| m.trim().to_ascii_uppercase());
+    let contains = a.opt_str("path_contains")?;
+    let prefix = a.opt_str("file_prefix")?.map(crate::model::normalize_rel);
+    let limit = a.limit("limit", 200, 2000)?;
+    let graph = s.graph()?;
+    let mut routes: Vec<_> = graph
+        .routes()
+        .filter(|r| {
+            method
+                .as_deref()
+                .is_none_or(|m| r.method == m || r.method == "ANY")
+        })
+        .filter(|r| contains.is_none_or(|c| r.path.contains(c)))
+        .filter(|r| {
+            prefix
+                .as_deref()
+                .is_none_or(|p| path_has_prefix(&r.file, p))
+        })
+        .collect();
+    routes.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.method.cmp(&b.method)));
+    let total = routes.len();
+    let items: Vec<Value> = routes
+        .iter()
+        .take(limit)
+        .map(|r| json!({ "method": r.method, "path": r.path, "handler": r.handler, "file": r.file, "line": r.line }))
+        .collect();
+    Ok(json!({ "total": total, "truncated": total > limit, "routes": items }))
+}
+
+fn tool_scan(s: &Server, mode: Refresh) -> ToolResult {
+    let stats = s.ensure_index(mode)?.unwrap_or_default();
+    let index = read(&s.graph).stats();
+    Ok(json!({ "scan": stats, "index": index }))
+}
+
+fn tool_scan_repo(s: &Server, _: &Session, _: &Args) -> ToolResult {
+    tool_scan(s, Refresh::Full)
+}
+
+fn tool_scan_incremental(s: &Server, _: &Session, _: &Args) -> ToolResult {
+    tool_scan(s, Refresh::Now)
+}
+
+// ── Phase 2 handlers ───────────────────────────────────────────────────────────
+
+fn tool_eval_plan(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let raw = a
+        .get("files_to_touch")
+        .ok_or("missing required argument 'files_to_touch'")?;
+    let items: Vec<&Value> = match raw {
+        Value::Array(items) => items.iter().collect(),
+        Value::String(_) | Value::Object(_) => vec![raw],
+        _ => return Err("'files_to_touch' must be an array".into()),
+    };
+    if items.is_empty() {
+        return Err("'files_to_touch' is empty".into());
+    }
+    let planned: Vec<PlannedFile> = items
+        .into_iter()
+        .map(|item| match item {
+            Value::String(path) => Ok(PlannedFile::path(path.clone())),
+            Value::Object(obj) => {
+                let path = obj
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or("each object in 'files_to_touch' needs a string 'path'")?;
+                let content = match obj.get("content") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(c)) => Some(c.clone()),
+                    Some(_) => return Err("'content' must be a string".to_string()),
+                };
+                Ok(PlannedFile {
+                    path: path.to_string(),
+                    content,
+                })
+            }
+            _ => {
+                Err("'files_to_touch' items must be strings or {path, content} objects".to_string())
+            }
+        })
+        .collect::<Result<_, _>>()?;
+    let result = invariant::eval_plan(&s.root, &planned);
+    let summary = if let Some(err) = &result.config_error {
+        format!("BLOCKED: the rules file is invalid ({err})")
+    } else if !result.allowed {
+        format!(
+            "BLOCKED: {} error(s), {} warning(s)",
+            result.errors, result.warnings
+        )
+    } else if result.warnings > 0 {
+        format!("ALLOWED with {} warning(s)", result.warnings)
+    } else if result.rules_loaded == 0 {
+        "ALLOWED: no architectural rules are defined for this project".to_string()
+    } else {
+        format!(
+            "ALLOWED: no violations ({} rule(s), {} file(s))",
+            result.rules_loaded, result.files_evaluated
+        )
+    };
+    let mut out = serde_json::to_value(&result).map_err(|e| e.to_string())?;
+    out["summary"] = json!(summary);
+    Ok(out)
+}
+
+fn tool_list_rules(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let path = a.opt_str("path")?;
+    let (rules, source) = invariant::rules_for_path(&s.root, path)?;
+    let source = source.map(|p| {
+        p.strip_prefix(&s.root)
+            .unwrap_or(&p)
+            .to_string_lossy()
+            .replace('\\', "/")
+    });
+    Ok(json!({ "source": source, "total": rules.len(), "rules": rules }))
+}
+
+// ── Phase 3 handlers ───────────────────────────────────────────────────────────
+
+fn tool_search_decisions(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let query = a.str("query")?.unwrap_or("");
+    let status = a.opt_str("status")?;
+    if let Some(status) = status {
+        status.parse::<DecisionStatus>()?;
+    }
+    let limit = a.limit("limit", 10, 100)?;
+    let include_body = a.bool("include_body", true)?;
+    let hits = adr::search(
+        &s.root,
+        &SearchOptions {
+            query,
+            status,
+            limit,
+        },
+    );
+    let results: Vec<Value> = hits
+        .iter()
+        .map(|(r, score)| {
+            let mut v = json!({
                 "id": r.id,
                 "title": r.title,
                 "status": r.status,
                 "date": r.date,
                 "path": r.path,
-                "context": r.context,
-                "decision": r.decision,
-                "consequences": r.consequences,
-            })
-        })
-        .collect();
-    Ok(json!({ "query": query, "results": decs }))
-}
-
-/// Phase 3: record_decision(title, context, decision, consequences)
-fn handle_record_decision(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let title = args.get("title").and_then(|v| v.as_str()).unwrap_or("");
-    let context = args.get("context").and_then(|v| v.as_str()).unwrap_or("");
-    let decision = args.get("decision").and_then(|v| v.as_str()).unwrap_or("");
-    let consequences = args
-        .get("consequences")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    let path = adr_record(&s.root, title, context, decision, consequences);
-    Ok(json!({ "path": path.to_string_lossy() }))
-}
-
-/// Phase 4: get_recent_history(limit)
-fn handle_recent_history(s: &Server, args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
-    let records = s.store.get_recent_history(limit).unwrap();
-    let result: Vec<Value> = records
-        .into_iter()
-        .map(|r| {
-            json!({
-                "session_id": r.session_id,
-                "timestamp_ms": r.timestamp_ms,
-                "agent_name": r.agent_name,
-                "summary": r.summary,
-            })
-        })
-        .collect();
-    Ok(json!({ "history": result }))
-}
-
-/// Phase 1: scan_repo(root?)
-fn handle_scan_repo(s: &Server, _args: &serde_json::Map<String, Value>) -> io::Result<Value> {
-    let (graph, stats) = scan_repo(&s.root);
-    Ok(json!({
-        "files_scanned": stats.reparsed,
-        "files_total": stats.files_total,
-        "symbols_found": graph.symbols.len(),
-        "imports_found": graph.imports.len(),
-        "routes_found": graph.routes.len(),
-        "call_edges": graph.call_edges.len(),
-        "errors": stats.errors,
-    }))
-}
-
-/// Phase 1: scan_incremental(root?)
-fn handle_scan_incremental(
-    s: &Server,
-    _args: &serde_json::Map<String, Value>,
-) -> io::Result<Value> {
-    let (_graph, stats, touched) = scan_incremental(&s.root, &std::collections::HashMap::new());
-    Ok(json!({
-        "files_scanned": stats.reparsed,
-        "files_total": stats.files_total,
-        "reparsed": touched.len(),
-        "skipped": stats.errors,
-    }))
-}
-
-// ── JSON-RPC / MCP protocol plumbing ──────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-pub struct JsonRpcRequest {
-    #[allow(dead_code)]
-    jsonrpc: String,
-    id: Option<serde_json::Value>,
-    method: String,
-    params: Option<serde_json::Map<String, Value>>,
-}
-
-/// Derive a Unix socket path from the project root.
-/// The socket lives in ~/.trace/<hash>/daemon.sock, providing per-project
-/// isolation so multiple projects don't share daemon state.
-#[cfg(unix)]
-pub fn socket_path_for_root(root: &Path) -> PathBuf {
-    let abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    abs.hash(&mut hasher);
-    let hash = hasher.finish();
-    let trace_home = trace_home_dir();
-    trace_home
-        .join(format!("project-{:x}", hash))
-        .join("daemon.sock")
-}
-
-/// Resolve the user's trace home directory (~/.trace).
-pub fn trace_home_dir() -> PathBuf {
-    if let Some(home) = dirs::home_dir() {
-        home.join(".trace")
-    } else {
-        PathBuf::from(".trace")
-    }
-}
-
-/// Check if a daemon is listening on the given Unix socket.
-#[cfg(unix)]
-pub fn is_daemon_alive(socket_path: &Path) -> bool {
-    use std::os::unix::net::UnixStream;
-    UnixStream::connect(socket_path).is_ok()
-}
-
-/// Ensure the daemon is running for the given project root.
-/// If it's not, spawn it in the background and wait for the socket to appear.
-#[cfg(unix)]
-pub fn ensure_daemon_running(root: &Path) -> io::Result<()> {
-    let socket_path = socket_path_for_root(root);
-    if is_daemon_alive(&socket_path) {
-        return Ok(());
-    }
-
-    // Auto-start the daemon
-    spawn_daemon(root)?;
-
-    // Wait for the socket to become available (up to 5s)
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        if is_daemon_alive(&socket_path) {
-            return Ok(());
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "trace daemon failed to start within 5s",
-    ))
-}
-
-/// Spawn the trace daemon as a detached background process.
-#[cfg(unix)]
-fn spawn_daemon(root: &Path) -> io::Result<()> {
-    let exe = std::env::current_exe()?;
-    let socket_path = socket_path_for_root(root);
-
-    // Ensure the socket directory exists
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(&socket_path);
-
-    let _ = Command::new(&exe)
-        .arg("daemon")
-        .arg(root.to_string_lossy().to_string())
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(())
-}
-
-/// Run the MCP server as a daemon listening on a Unix socket.
-/// Processes requests from multiple agent shims concurrently via threads.
-#[cfg(unix)]
-pub fn run_mcp_daemon(root: PathBuf) -> io::Result<()> {
-    use std::os::unix::net::UnixListener;
-
-    let socket_path = socket_path_for_root(&root);
-    let server = Arc::new(Mutex::new(Server::new(root)));
-
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let _ = std::fs::remove_file(&socket_path);
-
-    let listener = UnixListener::bind(&socket_path)?;
-    eprintln!("trace daemon listening on {}", socket_path.display());
-
-    for stream in listener.incoming() {
-        let mut stream = stream?;
-        let server = Arc::clone(&server);
-        thread::spawn(move || {
-            let _ = handle_daemon_connection(&server, &mut stream);
-        });
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn handle_daemon_connection(
-    server: &Arc<Mutex<Server>>,
-    stream: &mut std::os::unix::net::UnixStream,
-) -> io::Result<()> {
-    let mut buf = vec![0u8; 65536];
-    let n = stream.read(&mut buf)?;
-    if n == 0 {
-        return Ok(());
-    }
-
-    let msg = String::from_utf8_lossy(&buf[..n]);
-    let req: JsonRpcRequest = match serde_json::from_str(&msg.trim()) {
-        Ok(req) => req,
-        Err(e) => {
-            let resp = json!({
-                "jsonrpc": "2.0",
-                "id": null,
-                "error": { "code": -32700, "message": format!("parse error: {}", e) }
             });
-            stream.write_all(format!("{}\n", resp).as_bytes())?;
-            return Ok(());
-        }
-    };
-
-    let server_guard = server.lock().unwrap();
-    if let Some(resp) = server_guard.process_request(&req) {
-        stream.write_all(format!("{}\n", resp).as_bytes())?;
-    }
-    Ok(())
-}
-
-/// Run the MCP server as a stdio shim that proxies to a background daemon.
-/// If the daemon isn't running, it auto-starts it. If auto-start fails
-/// (e.g. on first run), falls back to inline stdio mode.
-pub fn run_mcp_shim(root: PathBuf) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        let socket_path = socket_path_for_root(&root);
-        if ensure_daemon_running(&root).is_ok() {
-            return run_shim_loop(&socket_path);
-        }
-    }
-
-    // Fallback: inline stdio mode
-    eprintln!("trace: daemon unavailable, running in inline stdio mode");
-    run_mcp_server(root)
-}
-
-#[cfg(unix)]
-fn run_shim_loop(socket_path: &Path) -> io::Result<()> {
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        match proxy_to_daemon(socket_path, trimmed) {
-            Ok(resp) => println!("{}", resp),
-            Err(e) => {
-                eprintln!("trace shim: daemon connection lost: {}", e);
-                return Err(e);
+            if !query.trim().is_empty() {
+                v["score"] = json!((score * 100.0).round() / 100.0);
             }
-        }
+            if !r.tags.is_empty() {
+                v["tags"] = json!(r.tags);
+            }
+            if let Some(x) = &r.supersedes {
+                v["supersedes"] = json!(x);
+            }
+            if let Some(x) = &r.superseded_by {
+                v["superseded_by"] = json!(x);
+            }
+            if include_body {
+                v["context"] = truncate_text(&r.context, 1500);
+                v["decision"] = truncate_text(&r.decision, 1500);
+                v["consequences"] = truncate_text(&r.consequences, 1500);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "query": query, "total": results.len(), "results": results }))
+}
+
+fn tool_record_decision(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let new = NewDecision {
+        title: a.required_str("title")?.to_string(),
+        decision: a.required_str("decision")?.to_string(),
+        context: a.str("context")?.unwrap_or("").to_string(),
+        consequences: a.str("consequences")?.unwrap_or("").to_string(),
+        status: a.opt_str("status")?.map(str::to_string),
+        tags: a
+            .string_list("tags")?
+            .iter()
+            .flat_map(|t| t.split(','))
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect(),
+        supersedes: a.opt_str("supersedes")?.map(str::to_string),
+    };
+    let record = adr::record(&s.root, &new)?;
+    let mut out = json!({
+        "id": record.id,
+        "title": record.title,
+        "status": record.status,
+        "date": record.date,
+        "path": record.path,
+    });
+    if let Some(old) = &record.supersedes {
+        out["supersedes"] = json!(old);
     }
-    Ok(())
+    Ok(out)
 }
 
-#[cfg(unix)]
-fn proxy_to_daemon(socket_path: &Path, request: &str) -> io::Result<String> {
-    use std::os::unix::net::UnixStream;
-    let mut stream = UnixStream::connect(socket_path)?;
-    stream.write_all(format!("{}\n", request).as_bytes())?;
+// ── Phase 4 handlers ───────────────────────────────────────────────────────────
 
-    let mut buf = vec![0u8; 65536];
-    let n = stream.read(&mut buf)?;
-    Ok(String::from_utf8_lossy(&buf[..n]).trim_end().to_string())
-}
-
-/// Run in inline stdio mode (no daemon). Reads JSON-RPC from stdin, writes to stdout.
-pub fn run_mcp_server(root: PathBuf) -> io::Result<()> {
-    let server = Server::new(root);
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let req: JsonRpcRequest = match serde_json::from_str(trimmed) {
-            Ok(req) => req,
-            Err(e) => {
-                eprintln!("parse error: {}", e);
-                continue;
+fn tool_record_session(s: &Server, session: &Session, a: &Args) -> ToolResult {
+    let summary = a.required_str("summary")?.trim().to_string();
+    let agent = a
+        .opt_str("agent_name")?
+        .map(str::to_string)
+        .or_else(|| session.client_name.clone())
+        .unwrap_or_else(|| "agent".to_string());
+    let session_id = a
+        .opt_str("session_id")?
+        .map(|id| id.trim().to_string())
+        .unwrap_or_else(generate_session_id);
+    let mut touched = Vec::new();
+    let mut ignored = Vec::new();
+    let entries: Vec<&Value> = match a.get("touched_files") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => items.iter().collect(),
+        Some(_) => return Err("'touched_files' must be an array".into()),
+    };
+    for entry in entries {
+        let (path, reason) = match entry {
+            Value::String(p) => (p.as_str(), ""),
+            Value::Object(obj) => (
+                obj.get("path").and_then(Value::as_str).unwrap_or(""),
+                obj.get("reason").and_then(Value::as_str).unwrap_or(""),
+            ),
+            _ => {
+                return Err(
+                    "'touched_files' items must be strings or {path, reason} objects".into(),
+                )
             }
         };
-        if let Some(resp) = server.process_request(&req) {
-            println!("{}", resp);
+        match resolve_in_root(&s.root, path) {
+            Ok(r) if !r.rel.is_empty() => touched.push(TouchedFileRecord {
+                session_id: session_id.clone(),
+                file_path: r.rel,
+                change_reason: reason.trim().to_string(),
+            }),
+            Ok(_) | Err(_) => ignored.push(path.to_string()),
         }
     }
-    Ok(())
+    let record = SessionRecord {
+        session_id: session_id.clone(),
+        timestamp_ms: now_ms(),
+        agent_name: agent.clone(),
+        summary,
+    };
+    lock(&s.store)
+        .record_session(&record, &touched)
+        .map_err(|e| format!("failed to record session: {e}"))?;
+    let mut out =
+        json!({ "session_id": session_id, "agent_name": agent, "recorded_files": touched.len() });
+    if !ignored.is_empty() {
+        out["ignored_paths"] = json!(ignored);
+    }
+    Ok(out)
+}
+
+fn tool_recent_history(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let limit = a.limit("limit", 10, 100)?;
+    let agent = a.opt_str("agent_name")?;
+    let include_files = a.bool("include_files", true)?;
+    let store = lock(&s.store);
+    let sessions = store
+        .recent_history_with_files(limit, agent)
+        .map_err(|e| format!("failed to read history: {e}"))?;
+    let total = store.session_count().unwrap_or(sessions.len());
+    let items: Vec<Value> = sessions
+        .iter()
+        .map(|entry| {
+            let r = &entry.session;
+            let mut v = json!({
+                "session_id": r.session_id,
+                "agent_name": r.agent_name,
+                "summary": r.summary,
+                "timestamp_ms": r.timestamp_ms,
+            });
+            if let Some(age) = age_label(r.timestamp_ms) {
+                v["age"] = json!(age);
+            }
+            if include_files {
+                v["touched_files"] = json!(entry
+                    .touched_files
+                    .iter()
+                    .map(|t| {
+                        let mut f = json!({ "path": t.file_path });
+                        if !t.change_reason.is_empty() {
+                            f["reason"] = json!(t.change_reason);
+                        }
+                        f
+                    })
+                    .collect::<Vec<_>>());
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "total_sessions": total, "history": items }))
+}
+
+fn tool_file_history(s: &Server, _: &Session, a: &Args) -> ToolResult {
+    let path = a.required_str("path")?;
+    let rel = resolve_in_root(&s.root, path)?.rel;
+    let limit = a.limit("limit", 20, 200)?;
+    let rows = lock(&s.store)
+        .file_history(&rel, limit)
+        .map_err(|e| format!("failed to read history: {e}"))?;
+    let items: Vec<Value> = rows
+        .iter()
+        .map(|(r, reason)| {
+            let mut v = json!({
+                "session_id": r.session_id,
+                "agent_name": r.agent_name,
+                "summary": r.summary,
+                "timestamp_ms": r.timestamp_ms,
+            });
+            if !reason.is_empty() {
+                v["reason"] = json!(reason);
+            }
+            if let Some(age) = age_label(r.timestamp_ms) {
+                v["age"] = json!(age);
+            }
+            v
+        })
+        .collect();
+    Ok(json!({ "file": rel, "sessions": items }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn project(files: &[(&str, &str)]) -> (TempDir, Server) {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        for (rel, text) in files {
+            let path = dir.path().join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, text).unwrap();
+        }
+        let server = Server::new(dir.path().to_path_buf());
+        (dir, server)
+    }
+
+    fn rpc(server: &Server, session: &mut Session, msg: Value) -> Option<Value> {
+        server
+            .handle_message(session, &msg.to_string())
+            .map(|s| serde_json::from_str(&s).unwrap())
+    }
+
+    fn initialized(server: &Server, version: &str) -> Session {
+        let mut session = Session::default();
+        let resp = rpc(
+            server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":version,"capabilities":{},"clientInfo":{"name":"test-client","version":"1"}}}),
+        )
+        .unwrap();
+        assert!(resp.get("result").is_some(), "{resp}");
+        session
+    }
+
+    fn call(server: &Server, session: &mut Session, tool: &str, args: Value) -> (Value, bool) {
+        let resp = rpc(
+            server,
+            session,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+        )
+        .unwrap();
+        let result = &resp["result"];
+        let is_error = result["isError"].as_bool().unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let value = serde_json::from_str(text).unwrap_or_else(|_| json!(text));
+        (value, is_error)
+    }
+
+    #[test]
+    fn initialize_negotiates_supported_versions() {
+        let (_dir, server) = project(&[]);
+        let mut session = Session::default();
+        let resp = rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}),
+        )
+        .unwrap();
+        assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
+        assert_eq!(resp["result"]["serverInfo"]["name"], "trace");
+        assert_eq!(
+            resp["result"]["serverInfo"]["version"],
+            env!("CARGO_PKG_VERSION")
+        );
+        assert!(resp["result"]["capabilities"]["tools"].is_object());
+
+        let resp = rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"1999-01-01"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            resp["result"]["protocolVersion"],
+            SUPPORTED_PROTOCOL_VERSIONS[0]
+        );
+    }
+
+    #[test]
+    fn notifications_get_no_response_and_ping_works() {
+        let (_dir, server) = project(&[]);
+        let mut session = Session::default();
+        assert!(rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","method":"notifications/initialized"})
+        )
+        .is_none());
+        assert!(rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":1}})
+        )
+        .is_none());
+        let pong = rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":"p","method":"ping"}),
+        )
+        .unwrap();
+        assert_eq!(pong["id"], "p");
+        assert_eq!(pong["result"], json!({}));
+    }
+
+    #[test]
+    fn protocol_errors() {
+        let (_dir, server) = project(&[]);
+        let mut session = Session::default();
+        let parse = server.handle_message(&mut session, "{not json").unwrap();
+        assert!(parse.contains("-32700"));
+        let unknown = rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":3,"method":"bogus"}),
+        )
+        .unwrap();
+        assert_eq!(unknown["error"]["code"], METHOD_NOT_FOUND);
+        let tool = rpc(
+            &server,
+            &mut session,
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"nope"}}),
+        )
+        .unwrap();
+        assert_eq!(tool["error"]["code"], INVALID_PARAMS);
+        let bad_args = rpc(&server, &mut session, json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"find_symbol","arguments":[1]}})).unwrap();
+        assert_eq!(bad_args["error"]["code"], INVALID_PARAMS);
+        let empty_batch = server.handle_message(&mut session, "[]").unwrap();
+        assert!(empty_batch.contains("-32600"));
+        assert!(
+            rpc(
+                &server,
+                &mut session,
+                json!({"jsonrpc":"2.0","id":9,"result":{}})
+            )
+            .is_none(),
+            "client responses are ignored"
+        );
+    }
+
+    #[test]
+    fn batches_answer_requests_only() {
+        let (_dir, server) = project(&[]);
+        let mut session = Session::default();
+        let resp = rpc(
+            &server,
+            &mut session,
+            json!([
+                {"jsonrpc":"2.0","id":1,"method":"ping"},
+                {"jsonrpc":"2.0","method":"notifications/initialized"},
+                {"jsonrpc":"2.0","id":2,"method":"ping"}
+            ]),
+        )
+        .unwrap();
+        assert_eq!(resp.as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn tools_list_has_schemas_and_version_gated_annotations() {
+        let (_dir, server) = project(&[]);
+        let mut old = initialized(&server, "2024-11-05");
+        let resp = rpc(
+            &server,
+            &mut old,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let tools = resp["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), TOOLS.len());
+        assert!(tools.iter().all(|t| t["inputSchema"]["type"] == "object"));
+        assert!(tools.iter().all(|t| t.get("annotations").is_none()));
+        let outline = tools
+            .iter()
+            .find(|t| t["name"] == "get_symbol_outline")
+            .unwrap();
+        assert_eq!(outline["inputSchema"]["required"], json!(["path"]));
+
+        let mut new = initialized(&server, "2025-06-18");
+        let resp = rpc(
+            &server,
+            &mut new,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .unwrap();
+        let record = resp["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "record_decision")
+            .unwrap()
+            .clone();
+        assert_eq!(record["annotations"]["readOnlyHint"], false);
+        assert!(record["title"].is_string());
+    }
+
+    #[test]
+    fn structured_content_only_for_new_protocols() {
+        let (_dir, server) = project(&[("src/lib.rs", "pub fn a() {}")]);
+        let mut old = initialized(&server, "2025-03-26");
+        let resp = rpc(&server, &mut old, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_symbol_outline","arguments":{"path":"src/lib.rs"}}})).unwrap();
+        assert!(resp["result"].get("structuredContent").is_none());
+        let mut new = initialized(&server, "2025-06-18");
+        let resp = rpc(&server, &mut new, json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"get_symbol_outline","arguments":{"path":"src/lib.rs"}}})).unwrap();
+        assert_eq!(
+            resp["result"]["structuredContent"]["symbols"][0]["name"],
+            "a"
+        );
+    }
+
+    #[test]
+    fn outline_uses_relative_paths_and_rejects_escapes() {
+        let (_dir, server) = project(&[(
+            "src/lib.rs",
+            "pub struct User;\nimpl User { pub fn new() -> Self { User } }\n",
+        )]);
+        let mut session = initialized(&server, "2025-06-18");
+        let (out, err) = call(
+            &server,
+            &mut session,
+            "get_symbol_outline",
+            json!({"path": "src/lib.rs"}),
+        );
+        assert!(!err, "{out}");
+        assert_eq!(out["file"], "src/lib.rs");
+        assert_eq!(out["symbols"][1]["qualified_name"], "User::new");
+
+        let (msg, err) = call(
+            &server,
+            &mut session,
+            "get_symbol_outline",
+            json!({"path": "/etc/passwd"}),
+        );
+        assert!(err);
+        assert!(msg.as_str().unwrap().contains("outside the project root"));
+        let (_, err) = call(
+            &server,
+            &mut session,
+            "get_symbol_outline",
+            json!({"path": "../../x.rs"}),
+        );
+        assert!(err);
+        let (msg, err) = call(&server, &mut session, "get_symbol_outline", json!({}));
+        assert!(err);
+        assert!(msg
+            .as_str()
+            .unwrap()
+            .contains("missing required argument 'path'"));
+        let (msg, err) = call(
+            &server,
+            &mut session,
+            "get_symbol_outline",
+            json!({"path": "README.md"}),
+        );
+        assert!(err);
+        assert!(msg.as_str().unwrap().contains("unsupported file type"));
+    }
+
+    #[test]
+    fn index_tools_see_the_whole_repo_and_stay_fresh() {
+        let (dir, mut server) = project(&[
+            ("src/store.rs", "pub struct Store;\nimpl Store { pub fn open() -> Self { Store } }\n"),
+            ("src/main.rs", "use crate::store::Store;\nfn main() { let s = Store::open(); run(); }\nfn run() {}\n"),
+        ]);
+        server.refresh_interval = Duration::ZERO;
+        let mut session = initialized(&server, "2025-06-18");
+
+        let (callers, _) = call(
+            &server,
+            &mut session,
+            "find_callers",
+            json!({"symbol": "Store::open"}),
+        );
+        assert_eq!(callers["total"], 1, "{callers}");
+        assert_eq!(callers["callers"][0]["caller"], "main");
+        assert_eq!(callers["callers"][0]["confidence"], "exact");
+        assert_eq!(callers["definitions"][0]["file"], "src/store.rs");
+
+        let (callees, _) = call(
+            &server,
+            &mut session,
+            "find_callees",
+            json!({"symbol": "main"}),
+        );
+        let names: Vec<&str> = callees["callees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["callee"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["open", "run"]);
+        assert_eq!(callees["callees"][1]["defined_at"][0], "src/main.rs:3");
+
+        let (found, _) = call(
+            &server,
+            &mut session,
+            "find_symbol",
+            json!({"query": "stor"}),
+        );
+        assert_eq!(found["symbols"][0]["name"], "Store");
+
+        let (imports, _) = call(
+            &server,
+            &mut session,
+            "get_imports",
+            json!({"path": "src/main.rs"}),
+        );
+        assert_eq!(imports["imports"][0]["resolved"], "src/store.rs");
+        let (importers, _) = call(
+            &server,
+            &mut session,
+            "find_importers",
+            json!({"target": "src/store.rs"}),
+        );
+        assert_eq!(importers["importers"][0]["file"], "src/main.rs");
+
+        // A new caller appears without an explicit rescan.
+        std::fs::write(
+            dir.path().join("src/extra.rs"),
+            "fn extra() { crate::store::Store::open(); }\n",
+        )
+        .unwrap();
+        let (callers, _) = call(
+            &server,
+            &mut session,
+            "find_callers",
+            json!({"symbol": "open"}),
+        );
+        assert_eq!(callers["total"], 2, "{callers}");
+
+        let (scan, err) = call(&server, &mut session, "scan_incremental", json!({}));
+        assert!(!err);
+        assert_eq!(scan["index"]["files"], 3);
+        let (scan, _) = call(&server, &mut session, "scan_repo", json!({}));
+        assert_eq!(scan["scan"]["reparsed"], 3);
+
+        // The index persisted: a fresh server starts warm. (Files are aged
+        // first: just-written files are deliberately re-hashed.)
+        for rel in ["src/store.rs", "src/main.rs", "src/extra.rs"] {
+            let file = std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(rel))
+                .unwrap();
+            file.set_modified(std::time::SystemTime::now() - Duration::from_secs(60))
+                .unwrap();
+        }
+        let touched = server.ensure_index(Refresh::Now).unwrap().unwrap();
+        assert_eq!((touched.touched, touched.reparsed), (3, 0), "{touched:?}");
+        drop(server);
+        let server = Server::new(dir.path().to_path_buf());
+        let stats = server.ensure_index(Refresh::Now).unwrap().unwrap();
+        assert_eq!(stats.reparsed, 0, "{stats:?}");
+        assert_eq!(stats.skipped, 3, "{stats:?}");
+    }
+
+    #[test]
+    fn queries_racing_the_initial_index_wait_for_it() {
+        let (_dir, server) = project(&[(
+            "src/lib.rs",
+            "pub fn target() {}\npub fn caller() { target(); }\n",
+        )]);
+        let server = std::sync::Arc::new(server);
+        let warm = std::sync::Arc::clone(&server);
+        let warmup = std::thread::spawn(move || warm.ensure_index(Refresh::IfStale).unwrap());
+        let mut session = initialized(&server, "2025-06-18");
+        let (callers, _) = call(
+            &server,
+            &mut session,
+            "find_callers",
+            json!({"symbol": "target"}),
+        );
+        assert_eq!(callers["total"], 1, "{callers}");
+        warmup.join().unwrap();
+    }
+
+    #[test]
+    fn routes_tool() {
+        let (_dir, server) = project(&[(
+            "app.py",
+            "@app.get('/items')\nasync def items():\n    pass\n",
+        )]);
+        let mut session = initialized(&server, "2025-06-18");
+        let (routes, _) = call(
+            &server,
+            &mut session,
+            "list_routes",
+            json!({"method": "get"}),
+        );
+        assert_eq!(routes["routes"][0]["path"], "/items");
+        assert_eq!(routes["routes"][0]["handler"], "items");
+    }
+
+    #[test]
+    fn eval_plan_and_rules_tools() {
+        let (_dir, server) = project(&[(
+            ".architectural-rules.json",
+            r#"{"rules":[{"id":"no-db","target_path":"src/controllers/**","forbidden_imports":["crate::db"],"severity":"deny","message":"use services"}]}"#,
+        )]);
+        let mut session = initialized(&server, "2025-06-18");
+        let (out, err) = call(
+            &server,
+            &mut session,
+            "eval_plan",
+            json!({"files_to_touch": [{"path": "src/controllers/a.rs", "content": "use crate::db::pool;"}, "src/controllers/new.rs"]}),
+        );
+        assert!(!err, "{out}");
+        assert_eq!(out["allowed"], false);
+        assert_eq!(out["errors"], 1);
+        assert!(out["summary"].as_str().unwrap().starts_with("BLOCKED"));
+        assert_eq!(out["new_files"][0], "src/controllers/new.rs");
+
+        let (_, err) = call(
+            &server,
+            &mut session,
+            "eval_plan",
+            json!({"files_to_touch": []}),
+        );
+        assert!(err);
+        let (rules, _) = call(
+            &server,
+            &mut session,
+            "list_rules",
+            json!({"path": "src/controllers/x.rs"}),
+        );
+        assert_eq!(rules["total"], 1);
+        assert_eq!(rules["source"], ".architectural-rules.json");
+    }
+
+    #[test]
+    fn decisions_tools() {
+        let (_dir, server) = project(&[]);
+        let mut session = initialized(&server, "2025-06-18");
+        let (rec, err) = call(
+            &server,
+            &mut session,
+            "record_decision",
+            json!({"title": "Use SQLite", "context": "embedded", "decision": "rusqlite", "tags": ["storage"]}),
+        );
+        assert!(!err, "{rec}");
+        assert_eq!(rec["id"], "0001");
+        let (rec2, _) = call(
+            &server,
+            &mut session,
+            "record_decision",
+            json!({"title": "Use Postgres", "decision": "server db", "supersedes": "1"}),
+        );
+        assert_eq!(rec2["supersedes"], "0001");
+        let (found, _) = call(
+            &server,
+            &mut session,
+            "search_decisions",
+            json!({"query": "sqlite"}),
+        );
+        assert_eq!(found["results"][0]["status"], "Superseded");
+        let (all, _) = call(
+            &server,
+            &mut session,
+            "search_decisions",
+            json!({"include_body": false}),
+        );
+        assert_eq!(all["total"], 2);
+        assert!(all["results"][0].get("decision").is_none());
+        let (_, err) = call(
+            &server,
+            &mut session,
+            "search_decisions",
+            json!({"status": "bogus"}),
+        );
+        assert!(err);
+        let (_, err) = call(
+            &server,
+            &mut session,
+            "record_decision",
+            json!({"title": "x"}),
+        );
+        assert!(err, "decision is required");
+    }
+
+    #[test]
+    fn session_memory_tools() {
+        let (_dir, server) = project(&[("src/lib.rs", "")]);
+        let mut session = initialized(&server, "2025-06-18");
+        let (rec, err) = call(
+            &server,
+            &mut session,
+            "record_session",
+            json!({"summary": "Refactored store", "touched_files": [{"path": "src/lib.rs", "reason": "split module"}, "../outside.rs", "src/deleted.rs"]}),
+        );
+        assert!(!err, "{rec}");
+        assert_eq!(rec["agent_name"], "test-client");
+        assert_eq!(rec["recorded_files"], 2);
+        assert_eq!(rec["ignored_paths"], json!(["../outside.rs"]));
+        let session_id = rec["session_id"].as_str().unwrap().to_string();
+
+        let (hist, _) = call(
+            &server,
+            &mut session,
+            "get_recent_history",
+            json!({"limit": "5"}),
+        );
+        assert_eq!(hist["history"][0]["session_id"], session_id);
+        assert_eq!(hist["history"][0]["age"], "just now");
+        let files = hist["history"][0]["touched_files"].as_array().unwrap();
+        let lib = files.iter().find(|f| f["path"] == "src/lib.rs").unwrap();
+        assert_eq!(lib["reason"], "split module");
+
+        let (file, _) = call(
+            &server,
+            &mut session,
+            "get_file_history",
+            json!({"path": "src/lib.rs"}),
+        );
+        assert_eq!(file["sessions"][0]["reason"], "split module");
+
+        // Updating the same session keeps one record.
+        call(
+            &server,
+            &mut session,
+            "record_session",
+            json!({"summary": "Refactored store (done)", "session_id": session_id}),
+        );
+        let (hist, _) = call(&server, &mut session, "get_recent_history", json!({}));
+        assert_eq!(hist["total_sessions"], 1);
+        assert_eq!(hist["history"][0]["summary"], "Refactored store (done)");
+    }
+
+    #[test]
+    fn broad_roots_are_refused() {
+        let server = Server::new(PathBuf::from("/"));
+        assert!(server.blocked_reason().is_some());
+        let mut session = initialized(&server, "2025-06-18");
+        let (msg, err) = call(&server, &mut session, "find_symbol", json!({"query": "x"}));
+        assert!(err);
+        assert!(msg.as_str().unwrap().contains("refusing"));
+    }
+
+    #[test]
+    fn session_ids_are_unique() {
+        let ids: HashSet<String> = (0..200).map(|_| generate_session_id()).collect();
+        assert_eq!(ids.len(), 200);
+    }
 }
