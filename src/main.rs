@@ -69,7 +69,17 @@ fn main() -> anyhow::Result<()> {
         Commands::Daemon { root } => {
             let root = PathBuf::from(&root);
             eprintln!("trace daemon starting — root: {:?}", root);
-            trace::mcp::run_mcp_daemon(root)?;
+            #[cfg(unix)]
+            {
+                trace::mcp::run_mcp_daemon(root)?;
+            }
+            #[cfg(not(unix))]
+            {
+                eprintln!("trace daemon is only available on Unix systems (Linux/macOS)");
+                return Err(anyhow::anyhow!(
+                    "daemon mode is not supported on this platform"
+                ));
+            }
             Ok(())
         }
         Commands::Scan { root } => {
