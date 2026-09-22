@@ -40,7 +40,8 @@ mod tests {
 
     #[test]
     fn explicit_root_is_used_directly() {
-        let tmp = std::env::temp_dir().join(format!("trace-root-test-{}-explicit", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("trace-root-test-{}-explicit", std::process::id()));
         let _ = fs::remove_dir_all(&tmp);
         fs::create_dir_all(&tmp).unwrap();
         let resolved = resolve(Some(tmp.clone()), std::env::temp_dir().as_path()).unwrap();
@@ -73,7 +74,8 @@ mod tests {
 
     #[test]
     fn walks_upward_to_find_marker() {
-        let base = std::env::temp_dir().join(format!("trace-root-test-{}-walkup", std::process::id()));
+        let base =
+            std::env::temp_dir().join(format!("trace-root-test-{}-walkup", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("a/b/c")).unwrap();
         fs::write(base.join(".git"), "").unwrap();
