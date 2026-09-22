@@ -92,7 +92,12 @@ impl TraceStore {
         self.conn.execute(
             "INSERT OR REPLACE INTO sessions (session_id, timestamp, agent_name, summary)
              VALUES (?1, ?2, ?3, ?4)",
-            params![session.session_id, session.timestamp_ms, session.agent_name, session.summary],
+            params![
+                session.session_id,
+                session.timestamp_ms,
+                session.agent_name,
+                session.summary
+            ],
         )?;
         Ok(())
     }
@@ -103,7 +108,7 @@ impl TraceStore {
             "SELECT session_id, timestamp, agent_name, summary
              FROM sessions
              ORDER BY timestamp DESC
-             LIMIT ?1"
+             LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(SessionRecord {
@@ -139,7 +144,7 @@ impl TraceStore {
             "SELECT session_id, file_path, change_reason
              FROM touched_files
              WHERE session_id = ?1
-             ORDER BY file_path"
+             ORDER BY file_path",
         )?;
         let rows = stmt.query_map(params![session_id], |row| {
             Ok(TouchedFileRecord {
@@ -155,12 +160,17 @@ impl TraceStore {
 
     /// Append a historical event (file change, task step, bug note…).
     pub fn log_event(&self, event: &HistoricalEvent) -> SqlResult<()> {
-        let detail_json = serde_json::to_string(&event.detail)
-            .unwrap_or_else(|_| "{}".to_string());
+        let detail_json = serde_json::to_string(&event.detail).unwrap_or_else(|_| "{}".to_string());
         self.conn.execute(
             "INSERT INTO events (session_id, timestamp, agent_name, event_type, detail)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![&event.session_id, event.timestamp_ms, &event.agent_name, &event.event_type, detail_json],
+            params![
+                &event.session_id,
+                event.timestamp_ms,
+                &event.agent_name,
+                &event.event_type,
+                detail_json
+            ],
         )?;
         Ok(())
     }
@@ -172,11 +182,12 @@ impl TraceStore {
              FROM events
              WHERE session_id = ?1
              ORDER BY timestamp DESC
-             LIMIT ?2"
+             LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
             let detail_str: String = row.get(4)?;
-            let detail: serde_json::Value = serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
+            let detail: serde_json::Value =
+                serde_json::from_str(&detail_str).unwrap_or(serde_json::Value::Null);
             Ok(HistoricalEvent {
                 session_id: row.get(0)?,
                 timestamp_ms: row.get(1)?,
@@ -215,7 +226,13 @@ impl TraceStore {
     }
 
     /// Cache extracted symbols for a file (used by incremental scans).
-    pub fn cache_symbols(&self, rel: &str, mtime_ms: i64, size: u64, symbols_json: &str) -> SqlResult<()> {
+    pub fn cache_symbols(
+        &self,
+        rel: &str,
+        mtime_ms: i64,
+        size: u64,
+        symbols_json: &str,
+    ) -> SqlResult<()> {
         self.conn.execute(
             "INSERT OR REPLACE INTO scan_cache (rel_path, mtime_ms, size, symbols_json)
              VALUES (?1, ?2, ?3, ?4)",
@@ -242,9 +259,15 @@ impl TraceStore {
              (id, title, status, context, decision, consequences, created_at, author, supersedes)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                &dec.id, &dec.title, dec.status.to_string(),
-                &dec.context, &dec.decision, &dec.consequences,
-                dec.created_at_ms, &dec.author, &dec.supersedes
+                &dec.id,
+                &dec.title,
+                dec.status.to_string(),
+                &dec.context,
+                &dec.decision,
+                &dec.consequences,
+                dec.created_at_ms,
+                &dec.author,
+                &dec.supersedes
             ],
         )?;
         Ok(())
@@ -279,14 +302,11 @@ impl TraceStore {
     /// Delete old sessions and events older than `max_age_ms`.
     pub fn prune_history(&self, max_age_ms: i64) -> SqlResult<usize> {
         let cutoff = now_ms() - max_age_ms;
-        let count = self.conn.execute(
-            "DELETE FROM sessions WHERE timestamp < ?1",
-            params![cutoff],
-        )?;
-        self.conn.execute(
-            "DELETE FROM events WHERE timestamp < ?1",
-            params![cutoff],
-        )?;
+        let count = self
+            .conn
+            .execute("DELETE FROM sessions WHERE timestamp < ?1", params![cutoff])?;
+        self.conn
+            .execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff])?;
         Ok(count)
     }
 }
@@ -294,16 +314,23 @@ impl TraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Decision, DecisionStatus, HistoricalEvent, SessionRecord, TouchedFileRecord};
+    use crate::model::{
+        Decision, DecisionStatus, HistoricalEvent, SessionRecord, TouchedFileRecord,
+    };
 
     #[test]
     fn open_creates_tables() {
         let store = TraceStore::open_in_memory().unwrap();
         // Verify tables exist
-        let mut stmt = store.conn.prepare("SELECT name FROM sqlite_master WHERE type='table'").unwrap();
-        let tables: Vec<String> = stmt.query_map([], |row| {
-            row.get(0)
-        }).unwrap().collect::<Result<_, _>>().unwrap();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap();
+        let tables: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
         assert!(tables.contains(&"sessions".to_string()));
         assert!(tables.contains(&"touched_files".to_string()));
         assert!(tables.contains(&"events".to_string()));
@@ -331,8 +358,12 @@ mod tests {
     #[test]
     fn log_and_retrieve_touched_files() {
         let store = TraceStore::open_in_memory().unwrap();
-        store.log_touched_file("sess-001", "src/lib.rs", "added new function").unwrap();
-        store.log_touched_file("sess-001", "src/main.rs", "updated imports").unwrap();
+        store
+            .log_touched_file("sess-001", "src/lib.rs", "added new function")
+            .unwrap();
+        store
+            .log_touched_file("sess-001", "src/main.rs", "updated imports")
+            .unwrap();
         let files = store.get_touched_files("sess-001").unwrap();
         assert_eq!(files.len(), 2);
         assert!(files.iter().any(|f| f.file_path == "src/lib.rs"));
