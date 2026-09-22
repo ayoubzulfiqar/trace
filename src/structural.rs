@@ -165,7 +165,10 @@ impl StructuralGraph {
 
     /// Find all call sites where a given symbol (callee) is invoked.
     pub fn find_callers(&self, callee: &str) -> Vec<&CallEdge> {
-        self.call_edges.iter().filter(|e| e.callee == callee).collect()
+        self.call_edges
+            .iter()
+            .filter(|e| e.callee == callee)
+            .collect()
     }
 }
 
@@ -247,23 +250,82 @@ pub const LANGUAGES: &[LanguageSpec] = &[
 
 /// Extensions known NOT to be source code.
 pub const NON_CODE_EXTS: &[&str] = &[
-    "md", "markdown", "txt", "rst", "json", "toml", "ini", "lock",
-    "png", "jpg", "jpeg", "gif", "svg", "ico", "bmp", "woff", "ttf",
-    "css", "scss", "html", "htm", "csv", "log", "pdf", "zip", "tar", "gz",
-    "mp3", "mp4", "wav", "mov", "db", "sqlite", "db-wal", "db-journal",
-    "ipynb", "pyc", "class", "o", "so", "dll", "a", "exe", "lockb", "env",
-    "editorconfig", "gitignore", "gitattributes",
+    "md",
+    "markdown",
+    "txt",
+    "rst",
+    "json",
+    "toml",
+    "ini",
+    "lock",
+    "png",
+    "jpg",
+    "jpeg",
+    "gif",
+    "svg",
+    "ico",
+    "bmp",
+    "woff",
+    "ttf",
+    "css",
+    "scss",
+    "html",
+    "htm",
+    "csv",
+    "log",
+    "pdf",
+    "zip",
+    "tar",
+    "gz",
+    "mp3",
+    "mp4",
+    "wav",
+    "mov",
+    "db",
+    "sqlite",
+    "db-wal",
+    "db-journal",
+    "ipynb",
+    "pyc",
+    "class",
+    "o",
+    "so",
+    "dll",
+    "a",
+    "exe",
+    "lockb",
+    "env",
+    "editorconfig",
+    "gitignore",
+    "gitattributes",
 ];
 
 /// Skip directories that are build/cache/tool artifacts.
 pub const SKIP_DIRS: &[&str] = &[
-    "node_modules", ".git", ".next", "target", "dist", "build", "__pycache__",
-    ".venv", "venv", ".turbo", "coverage", ".cache", "vendor", ".claude",
-    ".vscode-test", ".vscode-server", ".idea", ".metals",
+    "node_modules",
+    ".git",
+    ".next",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".turbo",
+    "coverage",
+    ".cache",
+    "vendor",
+    ".claude",
+    ".vscode-test",
+    ".vscode-server",
+    ".idea",
+    ".metals",
 ];
 
 /// Extensions supported by a structural extractor.
-pub const SUPPORTED_EXTS: &[&str] = &["rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java"];
+pub const SUPPORTED_EXTS: &[&str] = &[
+    "rs", "py", "ts", "tsx", "js", "jsx", "mjs", "cjs", "go", "java",
+];
 
 /// Max file size to process (2 MB).
 pub const MAX_FILE_BYTES: u64 = 2_000_000;
@@ -276,11 +338,7 @@ pub fn is_scannable_ext(ext: &str) -> bool {
 // ── Per-file extraction ───────────────────────────────────────────────────────
 
 /// Extract structural symbols, imports, and routes from a single file's text.
-pub fn extract_file(
-    rel: &str,
-    ext: &str,
-    text: &str,
-) -> (Vec<Symbol>, Vec<Import>, Vec<Route>) {
+pub fn extract_file(rel: &str, ext: &str, text: &str) -> (Vec<Symbol>, Vec<Import>, Vec<Route>) {
     let mut symbols = Vec::new();
     let mut imports = Vec::new();
     let mut routes = Vec::new();
@@ -316,7 +374,11 @@ pub fn extract_call_edges(rel: &str, ext: &str, text: &str) -> Vec<CallEdge> {
 
 /// 1-indexed line number containing byte offset `pos` in `text`.
 fn line_of(text: &str, pos: usize) -> usize {
-    text.as_bytes()[..pos.min(text.len())].iter().filter(|&&b| b == b'\n').count() + 1
+    text.as_bytes()[..pos.min(text.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
+        .count()
+        + 1
 }
 
 /// Extract text from a tree-sitter node.
@@ -350,7 +412,9 @@ pub fn resolve_relative_import(
         return None;
     }
 
-    let from_dir = std::path::Path::new(from_file).parent().unwrap_or_else(|| std::path::Path::new(""));
+    let from_dir = std::path::Path::new(from_file)
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new(""));
     let mut components: Vec<String> = from_dir
         .components()
         .filter_map(|c| c.as_os_str().to_str().map(str::to_string))
@@ -358,7 +422,9 @@ pub fn resolve_relative_import(
     for part in to_module.split('/') {
         match part {
             "" | "." => {}
-            ".." => { components.pop(); }
+            ".." => {
+                components.pop();
+            }
             other => components.push(other.to_string()),
         }
     }
@@ -367,7 +433,9 @@ pub fn resolve_relative_import(
         return None;
     }
 
-    const EXTS: &[&str] = &["ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java"];
+    const EXTS: &[&str] = &[
+        "ts", "tsx", "js", "jsx", "mjs", "cjs", "rs", "py", "go", "java",
+    ];
     if known_files.contains(&normalized) {
         return Some(normalized.clone());
     }
@@ -400,7 +468,11 @@ fn extract_rs_syn(
 
     match syn::parse_file(text) {
         Ok(ast) => {
-            let mut visitor = RsVisitor { rel, symbols, depth: 0 };
+            let mut visitor = RsVisitor {
+                rel,
+                symbols,
+                depth: 0,
+            };
             syn::visit::visit_file(&mut visitor, &ast);
         }
         Err(_) => {
@@ -481,9 +553,8 @@ fn extract_rs(
     let axum_route_re = Regex::new(
         r#"\.route\s*\(\s*"([^"]+)"\s*,\s*((?:(?:get|post|put|patch|delete)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\)(?:\s*\.\s*(?:get|post|put|patch|delete)\s*\(\s*[A-Za-z_][A-Za-z0-9_]*\s*\))*))\s*\)"#
     ).unwrap();
-    let verb_handler_re = Regex::new(
-        r"(get|post|put|patch|delete)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)"
-    ).unwrap();
+    let verb_handler_re =
+        Regex::new(r"(get|post|put|patch|delete)\s*\(\s*([A-Za-z_][A-Za-z0-9_]*)\s*\)").unwrap();
     for cap in axum_route_re.captures_iter(text) {
         let path = cap[1].to_string();
         for vh in verb_handler_re.captures_iter(&cap[2]) {
@@ -497,13 +568,16 @@ fn extract_rs(
     }
 
     // Actix/Rocket routes: #[get("/path")]
-    let attr_route_re = Regex::new(
-        r#"(?m)^\s*#\[\s*(get|post|put|patch|delete)\s*\(\s*"([^"]+)"\s*\)\s*\]"#
-    ).unwrap();
+    let attr_route_re =
+        Regex::new(r#"(?m)^\s*#\[\s*(get|post|put|patch|delete)\s*\(\s*"([^"]+)"\s*\)\s*\]"#)
+            .unwrap();
     for cap in attr_route_re.captures_iter(text) {
         let after = &text[cap.get(0).unwrap().end()..];
         let fn_re = Regex::new(r"(?m)^\s*(?:pub\s+)?(?:async\s+)?fn\s+(\w+)").unwrap();
-        let handler = fn_re.captures(after).map(|c| c[1].to_string()).unwrap_or_else(|| "unknown".to_string());
+        let handler = fn_re
+            .captures(after)
+            .map(|c| c[1].to_string())
+            .unwrap_or_else(|| "unknown".to_string());
         routes.push(Route {
             method: cap[1].to_string().to_uppercase(),
             path: cap[2].to_string(),
@@ -592,24 +666,35 @@ impl<'ast, 'a> syn::visit::Visit<'ast> for RsVisitor<'a> {
 
 fn extract_call_edges_rs(rel: &str, text: &str, out: &mut Vec<CallEdge>) {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(tree_sitter_rust::language()).is_err() { return; }
-    let tree = match parser.parse(text, None) { Some(t) => t, None => return };
+    if parser.set_language(tree_sitter_rust::language()).is_err() {
+        return;
+    }
+    let tree = match parser.parse(text, None) {
+        Some(t) => t,
+        None => return,
+    };
     let bytes = text.as_bytes();
     let root = tree.root_node();
     let mut cursor = root.walk();
-    if !cursor.goto_first_child() { return; }
+    if !cursor.goto_first_child() {
+        return;
+    }
     loop {
         let node = cursor.node();
         if node.kind() == "function_item" {
             if let Some(name_node) = node.child_by_field_name("name") {
-                let caller = std::str::from_utf8(&bytes[name_node.start_byte()..name_node.end_byte()])
-                    .unwrap_or("").to_string();
+                let caller =
+                    std::str::from_utf8(&bytes[name_node.start_byte()..name_node.end_byte()])
+                        .unwrap_or("")
+                        .to_string();
                 if !caller.is_empty() {
                     collect_calls_in_node(&node, bytes, rel, &caller, out);
                 }
             }
         }
-        if !cursor.goto_next_sibling() { break; }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
     }
 }
 
@@ -624,9 +709,15 @@ fn collect_calls_in_node(
         if let Some(func) = node.child_by_field_name("function") {
             let callee = match func.kind() {
                 "identifier" => std::str::from_utf8(&bytes[func.start_byte()..func.end_byte()])
-                    .unwrap_or("").to_string(),
-                "field_expression" => func.child_by_field_name("field")
-                    .map(|f| std::str::from_utf8(&bytes[f.start_byte()..f.end_byte()]).unwrap_or("").to_string())
+                    .unwrap_or("")
+                    .to_string(),
+                "field_expression" => func
+                    .child_by_field_name("field")
+                    .map(|f| {
+                        std::str::from_utf8(&bytes[f.start_byte()..f.end_byte()])
+                            .unwrap_or("")
+                            .to_string()
+                    })
                     .unwrap_or_default(),
                 _ => String::new(),
             };
@@ -643,7 +734,9 @@ fn collect_calls_in_node(
     if c.goto_first_child() {
         loop {
             collect_calls_in_node(&c.node(), bytes, rel, caller, out);
-            if !c.goto_next_sibling() { break; }
+            if !c.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -712,7 +805,12 @@ fn walk_ts_js(
         "type_alias_declaration" => {
             if let Some(n) = node.child_by_field_name("name") {
                 let name = ts_text(n, bytes);
-                if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                if name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Class, // type alias as Class for concept matching
@@ -739,11 +837,18 @@ fn walk_ts_js(
                 if matches!(decl.kind(), "variable_declarator") {
                     if let Some(name_node) = decl.child_by_field_name("name") {
                         let name = ts_text(name_node, bytes);
-                        let name_upper = name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false);
+                        let name_upper = name
+                            .chars()
+                            .next()
+                            .map(|c| c.is_uppercase())
+                            .unwrap_or(false);
                         // Functions and arrow functions assigned to PascalCase names
                         if name_upper {
                             if let Some(val) = decl.child_by_field_name("value") {
-                                if matches!(val.kind(), "arrow_function" | "function_expression" | "class_expression") {
+                                if matches!(
+                                    val.kind(),
+                                    "arrow_function" | "function_expression" | "class_expression"
+                                ) {
                                     symbols.push(Symbol {
                                         name,
                                         kind: SymbolKind::Function,
@@ -769,45 +874,53 @@ fn walk_ts_js(
         if c.goto_first_child() {
             loop {
                 walk_ts_js(&c.node(), bytes, rel, symbols, imports, depth + 1);
-                if !c.goto_next_sibling() { break; }
+                if !c.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
 }
 
-fn extract_ts_import(
-    node: &tree_sitter::Node,
-    bytes: &[u8],
-    rel: &str,
-    imports: &mut Vec<Import>,
-) {
-    let source = node.child_by_field_name("source")
+fn extract_ts_import(node: &tree_sitter::Node, bytes: &[u8], rel: &str, imports: &mut Vec<Import>) {
+    let source = node
+        .child_by_field_name("source")
         .map(|n| ts_text(n, bytes))
         .unwrap_or_default();
-    if source.is_empty() { return; }
+    if source.is_empty() {
+        return;
+    }
 
-    let names: Vec<String> = node.children(&mut node.walk())
+    let names: Vec<String> = node
+        .children(&mut node.walk())
         .filter(|c| c.kind() == "import_clause" || c.kind() == "named_imports")
         .flat_map(|c| {
             let mut cur = c.walk();
-            c.children(&mut cur).flat_map(|spec| {
-                match spec.kind() {
+            c.children(&mut cur)
+                .flat_map(|spec| match spec.kind() {
                     "named_imports" => {
                         let mut cur2 = spec.walk();
                         spec.children(&mut cur2)
-                            .filter_map(|imp| imp.child_by_field_name("name").map(|n| ts_text(n, bytes)))
+                            .filter_map(|imp| {
+                                imp.child_by_field_name("name").map(|n| ts_text(n, bytes))
+                            })
                             .collect::<Vec<_>>()
                     }
-                    _ => spec.child_by_field_name("name")
+                    _ => spec
+                        .child_by_field_name("name")
                         .map(|n| ts_text(n, bytes))
                         .into_iter()
                         .collect::<Vec<_>>(),
-                }
-            }).collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
         })
         .collect();
 
-    let to_module = source.trim_matches('"').trim_matches('\'').trim_matches('`').to_string();
+    let to_module = source
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('`')
+        .to_string();
     imports.push(Import {
         from_file: rel.to_string(),
         to_module,
@@ -818,7 +931,10 @@ fn extract_ts_import(
 /// Extract API route declarations from TS/JS (Express, NestJS, Next.js).
 fn extract_ts_routes(rel: &str, text: &str, routes: &mut Vec<Route>) {
     // Express: app.get('/path', handler), router.post('/path', handler)
-    let re = Regex::new(r#"\b(?:app|router)\s*\.\s*(get|post|put|patch|delete|all)\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
+    let re = Regex::new(
+        r#"\b(?:app|router)\s*\.\s*(get|post|put|patch|delete|all)\s*\(\s*['"]([^'"]+)['"]"#,
+    )
+    .unwrap();
     for cap in re.captures_iter(text) {
         let method = cap[1].to_uppercase();
         let path = cap[2].to_string();
@@ -834,7 +950,10 @@ fn extract_ts_routes(rel: &str, text: &str, routes: &mut Vec<Route>) {
     let dec_re = Regex::new(r#"@([A-Z][A-Za-z]*)\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
     for cap in dec_re.captures_iter(text) {
         let method = cap[1].to_string();
-        if matches!(method.as_str(), "Get" | "Post" | "Put" | "Patch" | "Delete" | "All") {
+        if matches!(
+            method.as_str(),
+            "Get" | "Post" | "Put" | "Patch" | "Delete" | "All"
+        ) {
             routes.push(Route {
                 method: method.to_uppercase(),
                 path: cap[2].to_string(),
@@ -845,7 +964,8 @@ fn extract_ts_routes(rel: &str, text: &str, routes: &mut Vec<Route>) {
     }
 
     // Next.js App Router: export const GET/POST/etc
-    let next_re = Regex::new(r"export\s+(?:async\s+)?(?:GET|POST|PUT|PATCH|DELETE|ALL)\s*").unwrap();
+    let next_re =
+        Regex::new(r"export\s+(?:async\s+)?(?:GET|POST|PUT|PATCH|DELETE|ALL)\s*").unwrap();
     if next_re.is_match(text) {
         for _cap in next_re.captures_iter(text) {
             routes.push(Route {
@@ -869,8 +989,13 @@ fn extract_call_edges_ts(rel: &str, text: &str, out: &mut Vec<CallEdge>) {
         tree_sitter_javascript::language()
     };
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(lang).is_err() { return; }
-    let tree = match parser.parse(text, None) { Some(t) => t, None => return };
+    if parser.set_language(lang).is_err() {
+        return;
+    }
+    let tree = match parser.parse(text, None) {
+        Some(t) => t,
+        None => return,
+    };
     let bytes = text.as_bytes();
     walk_ts_calls(&tree.root_node(), bytes, rel, "global", out, 0);
 }
@@ -883,29 +1008,51 @@ fn walk_ts_calls(
     out: &mut Vec<CallEdge>,
     depth: usize,
 ) {
-    if depth > 50 { return; }
+    if depth > 50 {
+        return;
+    }
 
     let kind = node.kind();
-    let new_fn = if matches!(kind, "function_declaration" | "method_definition" | "arrow_function" | "function") {
+    let new_fn = if matches!(
+        kind,
+        "function_declaration" | "method_definition" | "arrow_function" | "function"
+    ) {
         node.child_by_field_name("name")
-            .map(|n| std::str::from_utf8(&bytes[n.start_byte()..n.end_byte()]).unwrap_or("").to_string())
+            .map(|n| {
+                std::str::from_utf8(&bytes[n.start_byte()..n.end_byte()])
+                    .unwrap_or("")
+                    .to_string()
+            })
             .filter(|s| !s.is_empty())
-    } else { None };
+    } else {
+        None
+    };
     let fn_ctx = new_fn.as_deref().unwrap_or(current_fn);
 
     if kind == "call_expression" {
         let callee = match node.child_by_field_name("function") {
             Some(f) => match f.kind() {
-                "identifier" => std::str::from_utf8(&bytes[f.start_byte()..f.end_byte()]).unwrap_or("").to_string(),
-                "member_expression" => f.child_by_field_name("property")
-                    .map(|p| std::str::from_utf8(&bytes[p.start_byte()..p.end_byte()]).unwrap_or("").to_string())
+                "identifier" => std::str::from_utf8(&bytes[f.start_byte()..f.end_byte()])
+                    .unwrap_or("")
+                    .to_string(),
+                "member_expression" => f
+                    .child_by_field_name("property")
+                    .map(|p| {
+                        std::str::from_utf8(&bytes[p.start_byte()..p.end_byte()])
+                            .unwrap_or("")
+                            .to_string()
+                    })
                     .unwrap_or_default(),
                 _ => String::new(),
             },
             None => String::new(),
         };
         if !callee.is_empty() && callee != fn_ctx && callee != "require" {
-            out.push(CallEdge { from_file: rel.to_string(), caller: fn_ctx.to_string(), callee });
+            out.push(CallEdge {
+                from_file: rel.to_string(),
+                caller: fn_ctx.to_string(),
+                callee,
+            });
         }
     }
 
@@ -913,7 +1060,9 @@ fn walk_ts_calls(
     if c.goto_first_child() {
         loop {
             walk_ts_calls(&c.node(), bytes, rel, fn_ctx, out, depth + 1);
-            if !c.goto_next_sibling() { break; }
+            if !c.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -928,8 +1077,13 @@ fn extract_py(
     routes: &mut Vec<Route>,
 ) {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(tree_sitter_python::language()).is_err() { return; }
-    let tree = match parser.parse(text, None) { Some(t) => t, None => return };
+    if parser.set_language(tree_sitter_python::language()).is_err() {
+        return;
+    }
+    let tree = match parser.parse(text, None) {
+        Some(t) => t,
+        None => return,
+    };
     let bytes = text.as_bytes();
     let root = tree.root_node();
     walk_py(&root, bytes, rel, symbols, imports, 0);
@@ -1049,7 +1203,9 @@ fn walk_py(
         if c.goto_first_child() {
             loop {
                 walk_py(&c.node(), bytes, rel, symbols, imports, depth + 1);
-                if !c.goto_next_sibling() { break; }
+                if !c.goto_next_sibling() {
+                    break;
+                }
             }
         }
     }
@@ -1057,13 +1213,17 @@ fn walk_py(
 
 fn extract_py_routes(rel: &str, text: &str, routes: &mut Vec<Route>) {
     // FastAPI: @app.get("/path"), @router.post("/path")
-    let re = Regex::new(r#"@(?:\w+)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]"#).unwrap();
+    let re = Regex::new(r#"@(?:\w+)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*['"]([^'"]+)['"]"#)
+        .unwrap();
     for cap in re.captures_iter(text) {
         // Find the next function definition after this decorator.
         let pos = cap.get(0).unwrap().end();
         let after = &text[pos..];
         let fn_re = Regex::new(r"^\s*def\s+([a-zA-Z_][a-zA-Z0-9_]*)").unwrap();
-        let handler = fn_re.captures(after).map(|c| c[1].to_string()).unwrap_or_default();
+        let handler = fn_re
+            .captures(after)
+            .map(|c| c[1].to_string())
+            .unwrap_or_default();
         routes.push(Route {
             method: cap[1].to_uppercase(),
             path: cap[2].to_string(),
@@ -1083,8 +1243,13 @@ fn extract_go(
     _routes: &mut Vec<Route>,
 ) {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(tree_sitter_go::language()).is_err() { return; }
-    let tree = match parser.parse(text, None) { Some(t) => t, None => return };
+    if parser.set_language(tree_sitter_go::language()).is_err() {
+        return;
+    }
+    let tree = match parser.parse(text, None) {
+        Some(t) => t,
+        None => return,
+    };
     let bytes = text.as_bytes();
     let root = tree.root_node();
     walk_go(&root, bytes, rel, symbols, imports);
@@ -1106,7 +1271,12 @@ fn walk_go(
                     if ch.kind() == "type_spec" {
                         if let Some(name_node) = ch.child_by_field_name("name") {
                             let name = ts_text(name_node, bytes);
-                            if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                            if name
+                                .chars()
+                                .next()
+                                .map(|c| c.is_uppercase())
+                                .unwrap_or(false)
+                            {
                                 let type_node = ch.child_by_field_name("type");
                                 let kind = match type_node.map(|n| n.kind()) {
                                     Some("interface_type") => SymbolKind::Interface,
@@ -1122,14 +1292,21 @@ fn walk_go(
                             }
                         }
                     }
-                    if !cursor.goto_next_sibling() { break; }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                 }
             }
         }
         "function_declaration" | "method_declaration" => {
             if let Some(name_node) = node.child_by_field_name("name") {
                 let name = ts_text(name_node, bytes);
-                if name.chars().next().map(|c| c.is_uppercase()).unwrap_or(false) {
+                if name
+                    .chars()
+                    .next()
+                    .map(|c| c.is_uppercase())
+                    .unwrap_or(false)
+                {
                     symbols.push(Symbol {
                         name,
                         kind: SymbolKind::Function,
@@ -1156,7 +1333,9 @@ fn walk_go(
                             });
                         }
                     }
-                    if !cursor.goto_next_sibling() { break; }
+                    if !cursor.goto_next_sibling() {
+                        break;
+                    }
                 }
             }
         }
@@ -1167,7 +1346,9 @@ fn walk_go(
     if c.goto_first_child() {
         loop {
             walk_go(&c.node(), bytes, rel, symbols, imports);
-            if !c.goto_next_sibling() { break; }
+            if !c.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -1182,8 +1363,13 @@ fn extract_java(
     routes: &mut Vec<Route>,
 ) {
     let mut parser = tree_sitter::Parser::new();
-    if parser.set_language(tree_sitter_java::language()).is_err() { return; }
-    let tree = match parser.parse(text, None) { Some(t) => t, None => return };
+    if parser.set_language(tree_sitter_java::language()).is_err() {
+        return;
+    }
+    let tree = match parser.parse(text, None) {
+        Some(t) => t,
+        None => return,
+    };
     let bytes = text.as_bytes();
     let root = tree.root_node();
     walk_java(&root, bytes, rel, symbols, imports, routes);
@@ -1239,7 +1425,10 @@ fn walk_java(
         let route_re = Regex::new(r#"@([A-Z][A-Za-z]*)\s*\(\s*['"]([^'"]+)['"]\s*\)"#).unwrap();
         if let Some(cap) = route_re.captures(&ann) {
             let method = cap[1].to_string();
-            if matches!(method.as_str(), "GetMapping" | "PostMapping" | "PutMapping" | "PatchMapping" | "DeleteMapping") {
+            if matches!(
+                method.as_str(),
+                "GetMapping" | "PostMapping" | "PutMapping" | "PatchMapping" | "DeleteMapping"
+            ) {
                 routes.push(Route {
                     method: method.replace("Mapping", "").to_uppercase(),
                     path: cap[2].to_string(),
@@ -1254,7 +1443,9 @@ fn walk_java(
     if c.goto_first_child() {
         loop {
             walk_java(&c.node(), bytes, rel, symbols, imports, routes);
-            if !c.goto_next_sibling() { break; }
+            if !c.goto_next_sibling() {
+                break;
+            }
         }
     }
 }
@@ -1269,23 +1460,33 @@ mod tests {
     fn rust_struct_extraction_via_syn() {
         let code = "pub struct User { name: String }\n";
         let (symbols, _imports, _routes) = extract_file("src/lib.rs", "rs", code);
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
-        assert!(symbols.iter().any(|s| s.observation_source == ObservationSource::Ast));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.observation_source == ObservationSource::Ast));
     }
 
     #[test]
     fn rust_function_extraction() {
         let code = "pub fn process() {}\npub async fn handle() {}\n";
         let (symbols, _, _) = extract_file("src/main.rs", "rs", code);
-        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Function));
-        assert!(symbols.iter().any(|s| s.name == "handle" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "handle" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn rust_trait_extraction() {
         let code = "pub trait Repository {}\n";
         let (symbols, _, _) = extract_file("src/repo.rs", "rs", code);
-        assert!(symbols.iter().any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Repository" && s.kind == SymbolKind::Interface));
     }
 
     #[test]
@@ -1301,8 +1502,14 @@ mod tests {
     fn rust_implementations_not_extracted_as_top_level() {
         let code = "pub struct Foo;\npub impl Foo { pub fn method(&self) {} }\n";
         let (symbols, _, _) = extract_file("src/lib.rs", "rs", code);
-        let top_funcs: Vec<_> = symbols.iter().filter(|s| s.kind == SymbolKind::Function).collect();
-        assert!(top_funcs.is_empty(), "methods inside impl blocks must not be top-level");
+        let top_funcs: Vec<_> = symbols
+            .iter()
+            .filter(|s| s.kind == SymbolKind::Function)
+            .collect();
+        assert!(
+            top_funcs.is_empty(),
+            "methods inside impl blocks must not be top-level"
+        );
     }
 
     #[test]
@@ -1319,8 +1526,12 @@ mod tests {
         app.route("/users", get(list_users).post(create_user));
         "#;
         let (_symbols, _imports, routes) = extract_file("src/main.rs", "rs", code);
-        assert!(routes.iter().any(|r| r.path == "/users" && r.method == "GET"));
-        assert!(routes.iter().any(|r| r.path == "/users" && r.method == "POST"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/users" && r.method == "GET"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/users" && r.method == "POST"));
     }
 
     #[test]
@@ -1330,13 +1541,17 @@ mod tests {
         pub fn health() -> &'static str { "ok" }
         "#;
         let (_symbols, _imports, routes) = extract_file("src/main.rs", "rs", code);
-        assert!(routes.iter().any(|r| r.path == "/health" && r.method == "GET"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/health" && r.method == "GET"));
     }
     #[test]
     fn ts_class_extraction() {
         let code = "export class Service {}\n";
         let (symbols, _, _) = extract_file("src/index.ts", "ts", code);
-        assert!(symbols.iter().any(|s| s.name == "Service" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Service" && s.kind == SymbolKind::Class));
     }
 
     #[test]
@@ -1352,28 +1567,36 @@ mod tests {
     fn express_route_extraction() {
         let code = "app.get('/api/users', handler)\n";
         let (_symbols, _imports, routes) = extract_file("src/app.ts", "ts", code);
-        assert!(routes.iter().any(|r| r.path == "/api/users" && r.method == "GET"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/api/users" && r.method == "GET"));
     }
 
     #[test]
     fn py_class_extraction() {
         let code = "class User:\n    pass\n";
         let (symbols, _, _) = extract_file("src/models.py", "py", code);
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn py_function_extraction() {
         let code = "def process():\n    pass\n";
         let (symbols, _, _) = extract_file("src/utils.py", "py", code);
-        assert!(symbols.iter().any(|s| s.name == "process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "process" && s.kind == SymbolKind::Function));
     }
 
     #[test]
     fn py_import_extraction() {
         let code = "from models import User\nimport os\n";
         let (_symbols, imports, _) = extract_file("src/main.py", "py", code);
-        assert!(imports.iter().any(|i| i.to_module == "models" && i.names.contains(&"User".to_string())));
+        assert!(imports
+            .iter()
+            .any(|i| i.to_module == "models" && i.names.contains(&"User".to_string())));
         assert!(imports.iter().any(|i| i.to_module == "os"));
     }
 
@@ -1385,21 +1608,27 @@ mod tests {
             return []
         "#;
         let (_symbols, _imports, routes) = extract_file("src/main.py", "py", code);
-        assert!(routes.iter().any(|r| r.path == "/items" && r.method == "GET"));
+        assert!(routes
+            .iter()
+            .any(|r| r.path == "/items" && r.method == "GET"));
     }
 
     #[test]
     fn go_struct_extraction() {
         let code = "type User struct {}\n";
         let (symbols, _, _) = extract_file("src/main.go", "go", code);
-        assert!(symbols.iter().any(|s| s.name == "User" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "User" && s.kind == SymbolKind::Class));
     }
 
     #[test]
     fn go_function_extraction() {
         let code = "func Process() {}\n";
         let (symbols, _, _) = extract_file("src/main.go", "go", code);
-        assert!(symbols.iter().any(|s| s.name == "Process" && s.kind == SymbolKind::Function));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Process" && s.kind == SymbolKind::Function));
     }
 
     #[test]
@@ -1414,7 +1643,9 @@ mod tests {
     fn java_class_extraction() {
         let code = "public class Service {}\n";
         let (symbols, _, _) = extract_file("src/Main.java", "java", code);
-        assert!(symbols.iter().any(|s| s.name == "Service" && s.kind == SymbolKind::Class));
+        assert!(symbols
+            .iter()
+            .any(|s| s.name == "Service" && s.kind == SymbolKind::Class));
     }
 
     #[test]
