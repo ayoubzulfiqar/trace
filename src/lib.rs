@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod model;
 pub mod root;
 pub mod scan;
+pub mod service;
 pub mod setup;
 pub mod store;
 pub mod structural;
