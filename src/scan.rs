@@ -4,7 +4,7 @@
 //! and stores them in a `StructuralGraph`. Only files whose hash changed
 //! are re-parsed (incremental), so large repos stay responsive.
 
-use crate::structural::{extract_file, StructuralGraph, ScannableFile};
+use crate::structural::{extract_file, ScannableFile, StructuralGraph};
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -55,10 +55,7 @@ pub mod incremental {
     /// Returns `Some(())` when the file content appears stale (changed on disk
     /// relative to the stored fingerprint), or `None` when the fingerprint
     /// is missing.
-    pub fn needs_reparse(
-        path: &Path,
-        stored: Option<(i64, u64)>,
-    ) -> bool {
+    pub fn needs_reparse(path: &Path, stored: Option<(i64, u64)>) -> bool {
         match file_fingerprint(path) {
             Some(current) => match stored {
                 Some(prev) => current != prev,
@@ -90,7 +87,10 @@ fn walk_dir_collect(root: &Path, current: &Path, out: &mut Vec<ScannableFile>) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if path.is_dir() {
-            if crate::structural::SKIP_DIRS.iter().any(|d| *d == name.as_ref()) {
+            if crate::structural::SKIP_DIRS
+                .iter()
+                .any(|d| *d == name.as_ref())
+            {
                 continue;
             }
             walk_dir_collect(root, &path, out);
@@ -102,7 +102,9 @@ fn walk_dir_collect(root: &Path, current: &Path, out: &mut Vec<ScannableFile>) {
             let Some(ext) = ext else { continue };
             if crate::structural::SUPPORTED_EXTS.iter().any(|e| e == &ext) {
                 let rel = path.strip_prefix(root).unwrap_or(&path);
-                let rel_str = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+                let rel_str = rel
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
                 if let Some(fingerprint) = incremental::file_fingerprint(&path) {
                     out.push(ScannableFile {
                         rel: crate::model::RelPath(rel_str),
