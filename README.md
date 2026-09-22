@@ -48,9 +48,20 @@ An architectural memory engine and MCP server for Rust projects. Provides real-t
 ```
 trace serve [root]     Start the MCP server (stdio mode)
 trace scan <root>      Index a repository and print summary statistics
+trace setup            Auto-detect installed AI agents and inject MCP config
+trace list-agents       List discovered AI agents (read-only, no modifications)
+trace test             Run all tests
 ```
 
 ## Installation
+
+### One-line installer (recommended)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/trace/main/install.sh | sh
+```
+
+This downloads a pre-compiled binary for your OS/architecture, installs it to `/usr/local/bin` (or `~/.local/bin`), and runs `trace setup` to auto-register the MCP server with any installed AI agents.
 
 ### From source
 
@@ -77,12 +88,34 @@ Register in your MCP client configuration:
 }
 ```
 
+### Agent registration
+
+After installation, run `trace setup` to auto-detect installed AI agents and register the MCP server configuration automatically:
+
+```bash
+trace setup
+```
+
+This scans for config files at known paths:
+
+| Agent | Config file | Format |
+|-------|------------|--------|
+| OpenCode | `~/.config/opencode/opencode.json` | JSON |
+| Hermes Agent | `~/.hermes/config.yaml` | YAML |
+| Claude Desktop | `~/.config/Claude/claude_desktop_config.json` (Linux) | JSON |
+| Cursor | `~/.cursor/mcp.json` | JSON |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
+
+For each discovered agent, `trace setup` injects a `trace` server entry pointing to the installed binary (resolved via `std::env::current_exe()` with PATH fallback). Existing server entries are preserved.
+
+Use `trace list-agents` to see which agents are detected without modifying any configs.
+
 ## Architecture
 
 ```
 trace/
 ├── src/
-│   ├── main.rs              CLI entry: Serve, Scan commands
+│   ├── main.rs              CLI entry: serve, scan, setup, list-agents, test
 │   ├── lib.rs               Module declarations and re-exports
 │   ├── structural.rs        AST indexing: StructuralGraph, Symbol, Import, Route, tree-sitter extraction
 │   ├── scan.rs              Incremental file scanning with hash-based change detection
@@ -97,6 +130,7 @@ trace/
 │   └── lib.rs               Module declarations and re-exports
 ├── docs/
 │   └── decisions/           ADR Markdown files (created by record_decision)
+├── install.sh               One-line installer with auto-discovery
 └── Cargo.toml
 ```
 
