@@ -170,6 +170,33 @@ fn resolve_trace_binary() -> Result<PathBuf> {
     ))
 }
 
+/// Create a discovery registry at `~/.trace/discovery.json` so future agents
+/// can auto-discover the trace daemon. The registry includes the binary path,
+/// the socket base directory, and which agents were registered in this run.
+fn create_discovery_registry(trace_binary: &Path, registered: &[&str]) -> Result<()> {
+    let trace_dir = dirs::home_dir()
+        .context("cannot find home directory")?
+        .join(".trace");
+    std::fs::create_dir_all(&trace_dir)
+        .with_context(|| format!("creating {}", trace_dir.display()))?;
+
+    let registry = json!({
+        "binary": trace_binary.to_string_lossy(),
+        "socket_base_dir": trace_dir.to_string_lossy(),
+        "socket_uri": "mcp://trace",
+        "registered_agents": registered,
+        "timestamp": crate::humanize::now_ms(),
+    });
+
+    let registry_path = trace_dir.join("discovery.json");
+    let formatted = serde_json::to_string_pretty(&registry)?;
+    std::fs::write(&registry_path, formatted)
+        .with_context(|| format!("writing {}", registry_path.display()))?;
+
+    println!("Discovery registry written to {}", registry_path.display());
+    Ok(())
+}
+
 /// Detect all installed AI agents on this machine and automatically inject the
 /// trace MCP server configuration into each discovered agent's config file.
 ///
@@ -194,10 +221,10 @@ pub fn auto_detect_and_register() -> Result<()> {
     }
     println!();
 
-    let mut registered = 0;
+    let mut registered_names: Vec<&str> = Vec::new();
     let mut failed = 0;
 
-    for agent in agents {
+    for agent in &agents {
         let args = ["serve"];
         let result = match agent.format {
             ConfigFormat::Json => {
@@ -210,11 +237,11 @@ pub fn auto_detect_and_register() -> Result<()> {
 
         match result {
             Ok(_) => {
-                println!("✓ Auto-integrated with {}", agent.name);
-                registered += 1;
+                println!("\u{2713} Auto-integrated with {}", agent.name);
+                registered_names.push(&agent.name);
             }
             Err(e) => {
-                println!("✗ Failed to integrate with {}: {}", agent.name, e);
+                println!("\u{2717} Failed to integrate with {}: {}", agent.name, e);
                 failed += 1;
             }
         }
@@ -223,8 +250,11 @@ pub fn auto_detect_and_register() -> Result<()> {
     println!();
     println!(
         "Registration complete: {} succeeded, {} failed",
-        registered, failed
+        registered_names.len(),
+        failed
     );
+
+    create_discovery_registry(&trace_binary, &registered_names)?;
 
     Ok(())
 }
