@@ -4,8 +4,19 @@
 //! Phase 2: eval_plan
 //! Phase 3: search_decisions, record_decision
 //! Phase 4: get_recent_history
+//!
+//! Supports two run modes:
+//! - `trace serve` (stdio shim): proxies JSON-RPC requests to a background daemon
+//!   via Unix socket, auto-starting the daemon if needed. Falls back to inline
+//!   stdio mode if the daemon cannot be started.
+//! - `trace daemon` (background daemon): listens on a Unix socket and processes
+//!   requests with full project state.
 use serde_json::{json, Value};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use crate::adr::{record_decision as adr_record, search_decisions};
 use crate::invariant::eval_plan;
@@ -63,11 +74,11 @@ static TOOLS: &[ToolDef] = &[
 pub struct Server {
     pub store: TraceStore,
     pub graph: StructuralGraph,
-    pub root: std::path::PathBuf,
+    pub root: PathBuf,
 }
 
 impl Server {
-    pub fn new(root: std::path::PathBuf) -> Self {
+    pub fn new(root: PathBuf) -> Self {
         let db_path = root.join(".trace/trace.db");
         let store =
             TraceStore::open(&db_path).unwrap_or_else(|_| TraceStore::open_in_memory().unwrap());
@@ -76,6 +87,84 @@ impl Server {
             graph: StructuralGraph::new(),
             root,
         }
+    }
+
+    /// Process a single JSON-RPC request and return the response string.
+    /// Returns None for notifications (methods that don't receive a response,
+    /// e.g. "initialized").
+    pub fn process_request(&self, req: &JsonRpcRequest) -> Option<String> {
+        let id = req.id.clone().unwrap_or(json!(null));
+        let params = req.params.clone().unwrap_or_default();
+
+        let resp = match req.method.as_str() {
+            "initialize" => {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": {
+                        "protocolVersion": "0.1",
+                        "capabilities": { "tools": {} },
+                    }
+                })
+            }
+            "initialized" => return None, // notification — no response
+            "tools/list" => {
+                let tools: Vec<Value> = TOOLS
+                    .iter()
+                    .map(|t| {
+                        json!({
+                            "name": t.name,
+                            "description": t.description,
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {},
+                            },
+                        })
+                    })
+                    .collect();
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } })
+            }
+            "tools/call" => {
+                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                match dispatch(tool_name) {
+                    Some(handler) => match handler(self, &args) {
+                        Ok(result) => {
+                            let content = json!([{ "type": "text", "text": result.to_string() }]);
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": { "content": content }
+                            })
+                        }
+                        Err(e) => json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "error": { "code": -32000, "message": e.to_string() }
+                        }),
+                    },
+                    None => json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "error": { "code": -32601, "message": format!("unknown tool: {}", tool_name) }
+                    }),
+                }
+            }
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": format!("method not found: {}", req.method),
+                }
+            }),
+        };
+
+        Some(resp.to_string())
     }
 }
 
@@ -106,7 +195,11 @@ fn handle_symbol_outline(s: &Server, args: &serde_json::Map<String, Value>) -> i
         std::fs::read_to_string(&abs).map_err(|e| io::Error::new(io::ErrorKind::NotFound, e))?;
     let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
     if !is_scannable_ext(ext) {
-        return Ok(json!({"symbols": [], "error": format!("unsupported extension: {ext}")}));
+        return Ok(json!({
+            "symbols": [],
+            "file": path,
+            "error": format!("unsupported extension: {ext}")
+        }));
     }
     let (symbols, _imports, _routes) = extract_file(&abs.to_string_lossy(), ext, &text);
     let syms: Vec<Value> = symbols
@@ -283,7 +376,7 @@ fn handle_scan_incremental(
 // ── JSON-RPC / MCP protocol plumbing ──────────────────────────────────────────
 
 #[derive(serde::Deserialize)]
-struct JsonRpcRequest {
+pub struct JsonRpcRequest {
     #[allow(dead_code)]
     jsonrpc: String,
     id: Option<serde_json::Value>,
@@ -291,16 +384,196 @@ struct JsonRpcRequest {
     params: Option<serde_json::Map<String, Value>>,
 }
 
-fn send_response(id: &serde_json::Value, result: Option<Value>, error: Option<(i32, String)>) {
-    let resp = if let Some(err) = error {
-        json!({ "jsonrpc": "2.0", "id": id, "error": { "code": err.0, "message": err.1 } })
-    } else {
-        json!({ "jsonrpc": "2.0", "id": id, "result": result })
-    };
-    println!("{}", resp);
+/// Derive a Unix socket path from the project root.
+/// The socket lives in ~/.trace/<hash>/daemon.sock, providing per-project
+/// isolation so multiple projects don't share daemon state.
+#[cfg(unix)]
+pub fn socket_path_for_root(root: &Path) -> PathBuf {
+    let abs = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    abs.hash(&mut hasher);
+    let hash = hasher.finish();
+    let trace_home = trace_home_dir();
+    trace_home
+        .join(format!("project-{:x}", hash))
+        .join("daemon.sock")
 }
 
-pub fn run_mcp_server(root: std::path::PathBuf) -> io::Result<()> {
+/// Resolve the user's trace home directory (~/.trace).
+pub fn trace_home_dir() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        home.join(".trace")
+    } else {
+        PathBuf::from(".trace")
+    }
+}
+
+/// Check if a daemon is listening on the given Unix socket.
+#[cfg(unix)]
+pub fn is_daemon_alive(socket_path: &Path) -> bool {
+    use std::os::unix::net::UnixStream;
+    UnixStream::connect(socket_path).is_ok()
+}
+
+/// Ensure the daemon is running for the given project root.
+/// If it's not, spawn it in the background and wait for the socket to appear.
+#[cfg(unix)]
+pub fn ensure_daemon_running(root: &Path) -> io::Result<()> {
+    let socket_path = socket_path_for_root(root);
+    if is_daemon_alive(&socket_path) {
+        return Ok(());
+    }
+
+    // Auto-start the daemon
+    spawn_daemon(root)?;
+
+    // Wait for the socket to become available (up to 5s)
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        if is_daemon_alive(&socket_path) {
+            return Ok(());
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        "trace daemon failed to start within 5s",
+    ))
+}
+
+/// Spawn the trace daemon as a detached background process.
+#[cfg(unix)]
+fn spawn_daemon(root: &Path) -> io::Result<()> {
+    let exe = std::env::current_exe()?;
+    let socket_path = socket_path_for_root(root);
+
+    // Ensure the socket directory exists
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+
+    let _ = Command::new(&exe)
+        .arg("daemon")
+        .arg(root.to_string_lossy().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(())
+}
+
+/// Run the MCP server as a daemon listening on a Unix socket.
+/// Processes requests from multiple agent shims concurrently via threads.
+#[cfg(unix)]
+pub fn run_mcp_daemon(root: PathBuf) -> io::Result<()> {
+    use std::os::unix::net::UnixListener;
+
+    let socket_path = socket_path_for_root(&root);
+    let server = Arc::new(Mutex::new(Server::new(root)));
+
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let _ = std::fs::remove_file(&socket_path);
+
+    let listener = UnixListener::bind(&socket_path)?;
+    eprintln!("trace daemon listening on {}", socket_path.display());
+
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        let server = Arc::clone(&server);
+        thread::spawn(move || {
+            let _ = handle_daemon_connection(&server, &mut stream);
+        });
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn handle_daemon_connection(
+    server: &Arc<Mutex<Server>>,
+    stream: &mut std::os::unix::net::UnixStream,
+) -> io::Result<()> {
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf)?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let msg = String::from_utf8_lossy(&buf[..n]);
+    let req: JsonRpcRequest = match serde_json::from_str(&msg.trim()) {
+        Ok(req) => req,
+        Err(e) => {
+            let resp = json!({
+                "jsonrpc": "2.0",
+                "id": null,
+                "error": { "code": -32700, "message": format!("parse error: {}", e) }
+            });
+            stream.write_all(format!("{}\n", resp).as_bytes())?;
+            return Ok(());
+        }
+    };
+
+    let server_guard = server.lock().unwrap();
+    if let Some(resp) = server_guard.process_request(&req) {
+        stream.write_all(format!("{}\n", resp).as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Run the MCP server as a stdio shim that proxies to a background daemon.
+/// If the daemon isn't running, it auto-starts it. If auto-start fails
+/// (e.g. on first run), falls back to inline stdio mode.
+pub fn run_mcp_shim(root: PathBuf) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        let socket_path = socket_path_for_root(&root);
+        if ensure_daemon_running(&root).is_ok() {
+            return run_shim_loop(&socket_path);
+        }
+    }
+
+    // Fallback: inline stdio mode
+    eprintln!("trace: daemon unavailable, running in inline stdio mode");
+    run_mcp_server(root)
+}
+
+#[cfg(unix)]
+fn run_shim_loop(socket_path: &Path) -> io::Result<()> {
+    let stdin = io::stdin();
+    for line in stdin.lock().lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        match proxy_to_daemon(socket_path, trimmed) {
+            Ok(resp) => println!("{}", resp),
+            Err(e) => {
+                eprintln!("trace shim: daemon connection lost: {}", e);
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn proxy_to_daemon(socket_path: &Path, request: &str) -> io::Result<String> {
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.write_all(format!("{}\n", request).as_bytes())?;
+
+    let mut buf = vec![0u8; 65536];
+    let n = stream.read(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf[..n]).trim_end().to_string())
+}
+
+/// Run in inline stdio mode (no daemon). Reads JSON-RPC from stdin, writes to stdout.
+pub fn run_mcp_server(root: PathBuf) -> io::Result<()> {
     let server = Server::new(root);
     let stdin = io::stdin();
     for line in stdin.lock().lines() {
@@ -316,67 +589,8 @@ pub fn run_mcp_server(root: std::path::PathBuf) -> io::Result<()> {
                 continue;
             }
         };
-
-        let id = req.id.unwrap_or(json!(null));
-        let params = req.params.unwrap_or_default();
-
-        match req.method.as_str() {
-            "initialize" => {
-                send_response(
-                    &id,
-                    Some(json!({
-                        "protocolVersion": "0.1",
-                        "capabilities": { "tools": {} },
-                    })),
-                    None,
-                );
-            }
-            "initialized" => { /* notification — no response */ }
-            "tools/list" => {
-                let tools: Vec<Value> = TOOLS
-                    .iter()
-                    .map(|t| {
-                        json!({
-                            "name": t.name,
-                            "description": t.description,
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {},
-                            },
-                        })
-                    })
-                    .collect();
-                send_response(&id, Some(json!({ "tools": tools })), None);
-            }
-            "tools/call" => {
-                let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let args = params
-                    .get("arguments")
-                    .and_then(|v| v.as_object())
-                    .cloned()
-                    .unwrap_or_default();
-                match dispatch(tool_name) {
-                    Some(handler) => match handler(&server, &args) {
-                        Ok(result) => {
-                            let content = json!([{ "type": "text", "text": result.to_string() }]);
-                            send_response(&id, Some(json!({ "content": content })), None);
-                        }
-                        Err(e) => send_response(&id, None, Some((-32000, e.to_string()))),
-                    },
-                    None => send_response(
-                        &id,
-                        None,
-                        Some((-32601, format!("unknown tool: {tool_name}"))),
-                    ),
-                }
-            }
-            _ => {
-                send_response(
-                    &id,
-                    None,
-                    Some((-32601, format!("method not found: {}", req.method))),
-                );
-            }
+        if let Some(resp) = server.process_request(&req) {
+            println!("{}", resp);
         }
     }
     Ok(())
