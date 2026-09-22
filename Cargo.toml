@@ -1,6 +1,6 @@
 [package]
 name = "trace"
-version = "0.1.0"
+version = "1.6.9"
 edition = "2021"
 description = "Architectural Memory Engine — a Rust MCP server for codebase AST indexing, constraint enforcement, ADR graph, and execution memory"
 license = "MIT"
