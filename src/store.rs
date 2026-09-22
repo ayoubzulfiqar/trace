@@ -1,19 +1,31 @@
-//! Phase 4: Execution Memory & Session Drift Recovery.
+//! Phase 4: Execution Memory & the persistent structural index.
 //!
 //! SQLite-backed persistence for:
-//! - Events (structural facts, file fingerprints) — the AST index cache
-//! - Sessions (session_id, timestamp, agent_name, summary)
-//! - Touched files (session_id, file_path, change_reason)
-//! - Decisions (Phase 3 ADR metadata cache)
+//! - the structural index (per-file fingerprint, content hash and facts), so
+//!   a restarted server re-parses only what changed while it was down
+//! - sessions (session_id, timestamp, agent_name, summary)
+//! - touched files (session_id, file_path, change_reason)
+//! - events (free-form execution log)
+//! - a decisions cache (Phase 3 metadata)
 //!
-//! On startup, `get_recent_history` lets agents reconstruct context after
-//! context compression without re-reading thousands of prompt tokens.
+//! The database runs in WAL mode with a busy timeout so a daemon, inline
+//! servers and CLI invocations can share it safely.
 
 use crate::humanize::now_ms;
 use crate::model::{HistoricalEvent, SessionRecord, TouchedFileRecord};
-use rusqlite::{params, Connection, Result as SqlResult};
+use crate::structural::{FileFacts, IndexedFile, STRUCTURAL_EXTRACTOR_VERSION};
+use rayon::prelude::*;
+use rusqlite::{params, Connection, OptionalExtension, Result as SqlResult};
+use std::time::Duration;
 
-const SCHEMA: &str = r#"
+/// Rows encoded/decoded per parallel batch when persisting the index.
+const INDEX_CHUNK: usize = 1024;
+
+/// Schema version stored in `PRAGMA user_version`.
+pub const SCHEMA_VERSION: i32 = 2;
+
+/// Version 1: the original schema (kept verbatim so old databases upgrade).
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id  TEXT NOT NULL,
@@ -21,12 +33,6 @@ CREATE TABLE IF NOT EXISTS events (
     agent_name  TEXT NOT NULL,
     event_type  TEXT NOT NULL,
     detail      TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS fingerprints (
-    rel_path    TEXT PRIMARY KEY,
-    mtime_ms    INTEGER NOT NULL,
-    size        INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -54,38 +60,229 @@ CREATE TABLE IF NOT EXISTS decisions (
     author      TEXT NOT NULL,
     supersedes  TEXT
 );
-
-CREATE TABLE IF NOT EXISTS scan_cache (
-    rel_path     TEXT NOT NULL,
-    mtime_ms     INTEGER NOT NULL,
-    size         INTEGER NOT NULL,
-    symbols_json TEXT NOT NULL,
-    PRIMARY KEY (rel_path, mtime_ms)
-);
 "#;
+
+/// Version 2: persistent structural index; drop the never-used v1 caches;
+/// indexes for history queries.
+const SCHEMA_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS file_index (
+    rel_path          TEXT PRIMARY KEY,
+    mtime_ns          INTEGER NOT NULL,
+    size              INTEGER NOT NULL,
+    hash              INTEGER NOT NULL,
+    extractor_version INTEGER NOT NULL,
+    facts             TEXT NOT NULL
+) WITHOUT ROWID;
+
+DROP TABLE IF EXISTS scan_cache;
+DROP TABLE IF EXISTS fingerprints;
+
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
+CREATE INDEX IF NOT EXISTS idx_touched_files_path ON touched_files(file_path);
+"#;
+
+/// Run `op`, retrying while SQLite reports the database busy/locked
+/// (up to ~5 s with backoff).
+fn retry_busy<T>(mut op: impl FnMut() -> SqlResult<T>) -> SqlResult<T> {
+    let mut delay = Duration::from_millis(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match op() {
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if matches!(
+                    e.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(Duration::from_millis(200));
+            }
+            other => return other,
+        }
+    }
+}
 
 /// A single trace store — wraps a SQLite connection.
 pub struct TraceStore {
     pub conn: Connection,
 }
 
+/// One session with the files it touched.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionWithFiles {
+    #[serde(flatten)]
+    pub session: SessionRecord,
+    pub touched_files: Vec<TouchedFileRecord>,
+}
+
 impl TraceStore {
-    /// Open (or create) the SQLite database at `path`.
+    /// Open (or create) the SQLite database at `path`, migrating it to the
+    /// current schema.
     pub fn open(path: &std::path::Path) -> SqlResult<Self> {
-        std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("."))).ok();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         let conn = Connection::open(path)?;
-        // WAL mode for concurrent read/write access from multiple agent shims
-        conn.pragma_update(None, "journal_mode", &"WAL")?;
-        conn.pragma_update(None, "synchronous", &"NORMAL")?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(TraceStore { conn })
+        conn.busy_timeout(Duration::from_secs(5))?;
+        // WAL: concurrent readers + one writer across daemon/CLI processes.
+        // Switching a fresh file to WAL takes an exclusive lock that the busy
+        // handler does not always wait for, so contention is retried here.
+        retry_busy(|| {
+            conn.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))
+        })?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "temp_store", "MEMORY")?;
+        let mut store = TraceStore { conn };
+        retry_busy(|| store.migrate())?;
+        Ok(store)
     }
 
     /// Open an in-memory SQLite database (fallback when file-based DB is unavailable).
     pub fn open_in_memory() -> SqlResult<Self> {
         let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
-        Ok(TraceStore { conn })
+        let mut store = TraceStore { conn };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn migrate(&mut self) -> SqlResult<()> {
+        let version: i32 = self
+            .conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        // IMMEDIATE takes the write lock up front (a deferred transaction
+        // upgrading to write fails with BUSY without waiting); re-read the
+        // version under the lock in case another process just migrated.
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let version: i32 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        if version < 1 {
+            tx.execute_batch(SCHEMA_V1)?;
+        }
+        if version < 2 {
+            tx.execute_batch(SCHEMA_V2)?;
+        }
+        tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        tx.commit()
+    }
+
+    // ── Structural index ──────────────────────────────────────────────
+
+    /// Load every cached file produced by the current extractor version.
+    /// Rows from older extractors (or undecodable rows) are skipped, which
+    /// makes the next refresh re-parse those files. Rows are decoded in
+    /// parallel, a chunk at a time, so peak memory stays near the final size.
+    pub fn load_index(&self) -> SqlResult<Vec<(String, IndexedFile)>> {
+        // Rows from other extractor versions can never be used again.
+        let _ = self.conn.execute(
+            "DELETE FROM file_index WHERE extractor_version != ?1",
+            params![STRUCTURAL_EXTRACTOR_VERSION],
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path, mtime_ns, size, hash, facts FROM file_index
+             WHERE extractor_version = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![STRUCTURAL_EXTRACTOR_VERSION], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        loop {
+            let chunk: Vec<_> = rows.by_ref().take(INDEX_CHUNK).collect::<SqlResult<_>>()?;
+            if chunk.is_empty() {
+                break;
+            }
+            out.par_extend(chunk.into_par_iter().filter_map(
+                |(rel, mtime_ns, size, hash, facts)| {
+                    let mut facts: FileFacts = serde_json::from_str(&facts).ok()?;
+                    facts.set_path(&rel);
+                    Some((
+                        rel,
+                        IndexedFile {
+                            mtime_ns,
+                            size: size as u64,
+                            hash: hash as u64,
+                            facts,
+                        },
+                    ))
+                },
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Persist an index delta atomically (facts are encoded in parallel, a
+    /// chunk at a time).
+    pub fn save_index_changes(
+        &mut self,
+        upserts: &[(String, IndexedFile)],
+        touched: &[(String, i64, u64)],
+        removed: &[String],
+    ) -> SqlResult<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut upsert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO file_index
+                 (rel_path, mtime_ns, size, hash, extractor_version, facts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for chunk in upserts.chunks(INDEX_CHUNK) {
+                let encoded: Vec<String> = chunk
+                    .par_iter()
+                    .map(|(_, entry)| {
+                        serde_json::to_string(&entry.facts).unwrap_or_else(|_| "{}".into())
+                    })
+                    .collect();
+                for ((rel, entry), facts) in chunk.iter().zip(&encoded) {
+                    upsert.execute(params![
+                        rel,
+                        entry.mtime_ns,
+                        entry.size as i64,
+                        entry.hash as i64,
+                        STRUCTURAL_EXTRACTOR_VERSION,
+                        facts
+                    ])?;
+                }
+            }
+            let mut touch = tx.prepare_cached(
+                "UPDATE file_index SET mtime_ns = ?2, size = ?3 WHERE rel_path = ?1",
+            )?;
+            for (rel, mtime_ns, size) in touched {
+                touch.execute(params![rel, mtime_ns, *size as i64])?;
+            }
+            let mut delete = tx.prepare_cached("DELETE FROM file_index WHERE rel_path = ?1")?;
+            for rel in removed {
+                delete.execute(params![rel])?;
+            }
+        }
+        tx.commit()
+    }
+
+    /// Drop the whole structural index cache.
+    pub fn clear_index(&self) -> SqlResult<()> {
+        self.conn.execute("DELETE FROM file_index", [])?;
+        Ok(())
+    }
+
+    /// Number of cached files (any extractor version).
+    pub fn index_size(&self) -> SqlResult<usize> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM file_index", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
     }
 
     // ── Phase 4: Sessions ─────────────────────────────────────────────
@@ -105,15 +302,59 @@ impl TraceStore {
         Ok(())
     }
 
+    /// Record a session and the files it touched in one transaction. Files
+    /// already logged for the session get their reason updated.
+    pub fn record_session(
+        &mut self,
+        session: &SessionRecord,
+        touched: &[TouchedFileRecord],
+    ) -> SqlResult<()> {
+        let tx = self.conn.transaction()?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sessions (session_id, timestamp, agent_name, summary)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                session.session_id,
+                session.timestamp_ms,
+                session.agent_name,
+                session.summary
+            ],
+        )?;
+        {
+            let mut stmt = tx.prepare_cached(
+                "INSERT OR REPLACE INTO touched_files (session_id, file_path, change_reason)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for file in touched {
+                stmt.execute(params![
+                    session.session_id,
+                    file.file_path,
+                    file.change_reason
+                ])?;
+            }
+        }
+        tx.commit()
+    }
+
     /// Recent sessions, most recent first.
     pub fn get_recent_history(&self, limit: usize) -> SqlResult<Vec<SessionRecord>> {
+        self.recent_sessions(limit, None)
+    }
+
+    /// Recent sessions, optionally restricted to one agent.
+    pub fn recent_sessions(
+        &self,
+        limit: usize,
+        agent: Option<&str>,
+    ) -> SqlResult<Vec<SessionRecord>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timestamp, agent_name, summary
              FROM sessions
-             ORDER BY timestamp DESC
+             WHERE (?2 IS NULL OR agent_name = ?2)
+             ORDER BY timestamp DESC, rowid DESC
              LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |row| {
+        let rows = stmt.query_map(params![limit as i64, agent], |row| {
             Ok(SessionRecord {
                 session_id: row.get(0)?,
                 timestamp_ms: row.get(1)?,
@@ -122,6 +363,51 @@ impl TraceStore {
             })
         })?;
         rows.collect()
+    }
+
+    /// Recent sessions with their touched files.
+    pub fn recent_history_with_files(
+        &self,
+        limit: usize,
+        agent: Option<&str>,
+    ) -> SqlResult<Vec<SessionWithFiles>> {
+        self.recent_sessions(limit, agent)?
+            .into_iter()
+            .map(|session| {
+                let touched_files = self.get_touched_files(&session.session_id)?;
+                Ok(SessionWithFiles {
+                    session,
+                    touched_files,
+                })
+            })
+            .collect()
+    }
+
+    /// Look up one session.
+    pub fn get_session(&self, session_id: &str) -> SqlResult<Option<SessionRecord>> {
+        self.conn
+            .query_row(
+                "SELECT session_id, timestamp, agent_name, summary FROM sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionRecord {
+                        session_id: row.get(0)?,
+                        timestamp_ms: row.get(1)?,
+                        agent_name: row.get(2)?,
+                        summary: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+    }
+
+    /// Total number of recorded sessions.
+    pub fn session_count(&self) -> SqlResult<usize> {
+        self.conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(|n| n as usize)
     }
 
     // ── Phase 4: Touched files ────────────────────────────────────────
@@ -143,7 +429,7 @@ impl TraceStore {
 
     /// All files touched in a session.
     pub fn get_touched_files(&self, session_id: &str) -> SqlResult<Vec<TouchedFileRecord>> {
-        let mut stmt = self.conn.prepare(
+        let mut stmt = self.conn.prepare_cached(
             "SELECT session_id, file_path, change_reason
              FROM touched_files
              WHERE session_id = ?1
@@ -155,6 +441,34 @@ impl TraceStore {
                 file_path: row.get(1)?,
                 change_reason: row.get(2)?,
             })
+        })?;
+        rows.collect()
+    }
+
+    /// Sessions that touched `file_path`, most recent first, with the reason.
+    pub fn file_history(
+        &self,
+        file_path: &str,
+        limit: usize,
+    ) -> SqlResult<Vec<(SessionRecord, String)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.session_id, s.timestamp, s.agent_name, s.summary, t.change_reason
+             FROM touched_files t
+             JOIN sessions s ON s.session_id = t.session_id
+             WHERE t.file_path = ?1
+             ORDER BY s.timestamp DESC
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![file_path, limit as i64], |row| {
+            Ok((
+                SessionRecord {
+                    session_id: row.get(0)?,
+                    timestamp_ms: row.get(1)?,
+                    agent_name: row.get(2)?,
+                    summary: row.get(3)?,
+                },
+                row.get::<_, String>(4)?,
+            ))
         })?;
         rows.collect()
     }
@@ -178,13 +492,13 @@ impl TraceStore {
         Ok(())
     }
 
-    /// All events for a session.
+    /// Events for a session, most recent first.
     pub fn get_events(&self, session_id: &str, limit: usize) -> SqlResult<Vec<HistoricalEvent>> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, timestamp, agent_name, event_type, detail
              FROM events
              WHERE session_id = ?1
-             ORDER BY timestamp DESC
+             ORDER BY timestamp DESC, id DESC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![session_id, limit as i64], |row| {
@@ -200,57 +514,6 @@ impl TraceStore {
             })
         })?;
         rows.collect()
-    }
-
-    // ── Phase 1: AST index cache (fingerprints + symbols) ─────────────
-
-    /// Store a file fingerprint; returns true if it differs from what's stored.
-    pub fn fingerprint_changed(&self, rel: &str, mtime_ms: i64, size: u64) -> bool {
-        let changed: bool = match self.conn.query_row(
-            "SELECT mtime_ms, size FROM fingerprints WHERE rel_path = ?1",
-            params![rel],
-            |row| {
-                let mtime: i64 = row.get(0)?;
-                let sz: i64 = row.get(1)?;
-                Ok((mtime, sz) == (mtime_ms, size as i64))
-            },
-        ) {
-            Ok(same) => !same,
-            Err(rusqlite::Error::QueryReturnedNoRows) => true,
-            Err(_) => true,
-        };
-        if changed {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO fingerprints (rel_path, mtime_ms, size) VALUES (?1, ?2, ?3)",
-                params![rel, mtime_ms, size as i64],
-            ).ok();
-        }
-        changed
-    }
-
-    /// Cache extracted symbols for a file (used by incremental scans).
-    pub fn cache_symbols(
-        &self,
-        rel: &str,
-        mtime_ms: i64,
-        size: u64,
-        symbols_json: &str,
-    ) -> SqlResult<()> {
-        self.conn.execute(
-            "INSERT OR REPLACE INTO scan_cache (rel_path, mtime_ms, size, symbols_json)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![rel, mtime_ms, size as i64, symbols_json],
-        )?;
-        Ok(())
-    }
-
-    /// Retrieve cached symbols for a file if its fingerprint matches.
-    pub fn get_cached_symbols(&self, rel: &str, mtime_ms: i64, size: u64) -> Option<String> {
-        self.conn.query_row(
-            "SELECT symbols_json FROM scan_cache WHERE rel_path = ?1 AND mtime_ms = ?2 AND size = ?3",
-            params![rel, mtime_ms, size as i64],
-            |row| row.get::<_, String>(0),
-        ).ok()
     }
 
     // ── Phase 3: Decisions cache ──────────────────────────────────────
@@ -276,13 +539,22 @@ impl TraceStore {
         Ok(())
     }
 
-    /// Search cached decisions by keyword.
+    /// Search cached decisions by keyword (literal substring, case-insensitive).
     pub fn search_cached_decisions(&self, query: &str) -> SqlResult<Vec<crate::model::Decision>> {
-        let pattern = format!("%{}%", query.to_lowercase());
+        let escaped = query
+            .to_lowercase()
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
         let mut stmt = self.conn.prepare(
             "SELECT id, title, status, context, decision, consequences, created_at, author, supersedes
              FROM decisions
-             WHERE lower(title) LIKE ?1 OR lower(context) LIKE ?1 OR lower(decision) LIKE ?1"
+             WHERE lower(title) LIKE ?1 ESCAPE '\\'
+                OR lower(context) LIKE ?1 ESCAPE '\\'
+                OR lower(decision) LIKE ?1 ESCAPE '\\'
+                OR lower(consequences) LIKE ?1 ESCAPE '\\'
+             ORDER BY id",
         )?;
         let rows = stmt.query_map(params![&pattern], |row| {
             Ok(crate::model::Decision {
@@ -302,14 +574,18 @@ impl TraceStore {
         rows.collect()
     }
 
-    /// Delete old sessions and events older than `max_age_ms`.
-    pub fn prune_history(&self, max_age_ms: i64) -> SqlResult<usize> {
+    /// Delete sessions, their touched files, and events older than
+    /// `max_age_ms`. Returns the number of sessions removed.
+    pub fn prune_history(&mut self, max_age_ms: i64) -> SqlResult<usize> {
         let cutoff = now_ms() - max_age_ms;
-        let count = self
-            .conn
-            .execute("DELETE FROM sessions WHERE timestamp < ?1", params![cutoff])?;
-        self.conn
-            .execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff])?;
+        let tx = self.conn.transaction()?;
+        let count = tx.execute("DELETE FROM sessions WHERE timestamp < ?1", params![cutoff])?;
+        tx.execute(
+            "DELETE FROM touched_files WHERE session_id NOT IN (SELECT session_id FROM sessions)",
+            [],
+        )?;
+        tx.execute("DELETE FROM events WHERE timestamp < ?1", params![cutoff])?;
+        tx.commit()?;
         Ok(count)
     }
 }
@@ -317,14 +593,29 @@ impl TraceStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{
-        Decision, DecisionStatus, HistoricalEvent, SessionRecord, TouchedFileRecord,
-    };
+    use crate::model::{Decision, DecisionStatus};
+    use crate::structural::extract_file;
+
+    fn session(id: &str, ts: i64, agent: &str) -> SessionRecord {
+        SessionRecord {
+            session_id: id.to_string(),
+            timestamp_ms: ts,
+            agent_name: agent.to_string(),
+            summary: format!("summary of {id}"),
+        }
+    }
+
+    fn touched(session: &str, path: &str, reason: &str) -> TouchedFileRecord {
+        TouchedFileRecord {
+            session_id: session.to_string(),
+            file_path: path.to_string(),
+            change_reason: reason.to_string(),
+        }
+    }
 
     #[test]
-    fn open_creates_tables() {
+    fn open_creates_tables_and_sets_schema_version() {
         let store = TraceStore::open_in_memory().unwrap();
-        // Verify tables exist
         let mut stmt = store
             .conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table'")
@@ -334,28 +625,165 @@ mod tests {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap();
-        assert!(tables.contains(&"sessions".to_string()));
-        assert!(tables.contains(&"touched_files".to_string()));
-        assert!(tables.contains(&"events".to_string()));
-        assert!(tables.contains(&"decisions".to_string()));
-        assert!(tables.contains(&"scan_cache".to_string()));
+        for table in [
+            "sessions",
+            "touched_files",
+            "events",
+            "decisions",
+            "file_index",
+        ] {
+            assert!(tables.contains(&table.to_string()), "missing {table}");
+        }
+        assert!(!tables.contains(&"scan_cache".to_string()));
+        let version: i32 = store
+            .conn
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     #[test]
-    fn save_and_retrieve_session() {
-        let store = TraceStore::open_in_memory().unwrap();
-        let session = SessionRecord {
-            session_id: "sess-001".to_string(),
-            timestamp_ms: 1000,
-            agent_name: "hermes".to_string(),
-            summary: "fixed invariant parser".to_string(),
+    fn file_database_uses_wal_and_migrates_v1_databases() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.db");
+        {
+            // A database written by an old release: v1 tables, user_version 0.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE scan_cache (rel_path TEXT, mtime_ms INTEGER, size INTEGER, symbols_json TEXT);
+                 INSERT INTO sessions VALUES ('old', 1, 'agent', 'kept');",
+            )
+            .unwrap();
+        }
+        let store = TraceStore::open(&path).unwrap();
+        let mode: String = store
+            .conn
+            .pragma_query_value(None, "journal_mode", |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        assert_eq!(store.get_recent_history(10).unwrap()[0].summary, "kept");
+        assert_eq!(store.index_size().unwrap(), 0);
+        drop(store);
+        // Re-opening an up-to-date database is a no-op.
+        assert!(TraceStore::open(&path).is_ok());
+    }
+
+    #[test]
+    fn concurrent_opens_of_a_fresh_database_all_succeed() {
+        for _ in 0..20 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = std::sync::Arc::new(dir.path().join("trace.db"));
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(6));
+            let handles: Vec<_> = (0..6)
+                .map(|_| {
+                    let path = std::sync::Arc::clone(&path);
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        TraceStore::open(&path).map(|_| ())
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join()
+                    .unwrap()
+                    .expect("open must not fail with database is locked");
+            }
+        }
+    }
+
+    #[test]
+    fn index_round_trip_and_delta() {
+        let mut store = TraceStore::open_in_memory().unwrap();
+        let entry = |text: &str| IndexedFile {
+            mtime_ns: 10,
+            size: text.len() as u64,
+            hash: 42,
+            facts: extract_file("src/a.rs", text),
         };
-        store.save_session(&session).unwrap();
-        let history = store.get_recent_history(10).unwrap();
-        assert_eq!(history.len(), 1);
-        assert_eq!(history[0].session_id, "sess-001");
-        assert_eq!(history[0].agent_name, "hermes");
-        assert_eq!(history[0].summary, "fixed invariant parser");
+        store
+            .save_index_changes(
+                &[
+                    ("src/a.rs".into(), entry("pub fn a() {}")),
+                    ("src/b.rs".into(), entry("pub fn b() {}")),
+                ],
+                &[],
+                &[],
+            )
+            .unwrap();
+        store
+            .save_index_changes(&[], &[("src/a.rs".into(), 99, 7)], &["src/b.rs".into()])
+            .unwrap();
+        let loaded = store.load_index().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].0, "src/a.rs");
+        assert_eq!(loaded[0].1.mtime_ns, 99);
+        assert_eq!(loaded[0].1.size, 7);
+        assert_eq!(loaded[0].1.hash, 42);
+        assert_eq!(loaded[0].1.facts.symbols[0].name, "a");
+        assert_eq!(
+            &*loaded[0].1.facts.symbols[0].file, "src/a.rs",
+            "path restored on load"
+        );
+        let row: String = store
+            .conn
+            .query_row("SELECT facts FROM file_index", [], |r| r.get(0))
+            .unwrap();
+        assert!(
+            !row.contains("src/a.rs"),
+            "per-item paths are not persisted: {row}"
+        );
+    }
+
+    #[test]
+    fn stale_extractor_rows_are_ignored_and_purged() {
+        let store = TraceStore::open_in_memory().unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO file_index VALUES ('old.rs', 1, 1, 1, 0, '{}')",
+                [],
+            )
+            .unwrap();
+        assert!(store.load_index().unwrap().is_empty());
+        assert_eq!(store.index_size().unwrap(), 0);
+    }
+
+    #[test]
+    fn record_session_with_files_and_history() {
+        let mut store = TraceStore::open_in_memory().unwrap();
+        store
+            .record_session(
+                &session("s1", 1_000, "claude"),
+                &[
+                    touched("s1", "src/lib.rs", "added fn"),
+                    touched("s1", "src/main.rs", "wired"),
+                ],
+            )
+            .unwrap();
+        store
+            .record_session(
+                &session("s2", 2_000, "cursor"),
+                &[touched("s2", "src/lib.rs", "refactor")],
+            )
+            .unwrap();
+
+        let history = store.recent_history_with_files(10, None).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].session.session_id, "s2");
+        assert_eq!(history[1].touched_files.len(), 2);
+
+        let claude_only = store.recent_sessions(10, Some("claude")).unwrap();
+        assert_eq!(claude_only.len(), 1);
+
+        let file = store.file_history("src/lib.rs", 10).unwrap();
+        assert_eq!(file.len(), 2);
+        assert_eq!(file[0].0.session_id, "s2");
+        assert_eq!(file[0].1, "refactor");
+        assert_eq!(store.session_count().unwrap(), 2);
+        assert!(store.get_session("s1").unwrap().is_some());
+        assert!(store.get_session("nope").unwrap().is_none());
     }
 
     #[test]
@@ -369,8 +797,7 @@ mod tests {
             .unwrap();
         let files = store.get_touched_files("sess-001").unwrap();
         assert_eq!(files.len(), 2);
-        assert!(files.iter().any(|f| f.file_path == "src/lib.rs"));
-        assert!(files.iter().any(|f| f.file_path == "src/main.rs"));
+        assert_eq!(files[0].file_path, "src/lib.rs");
     }
 
     #[test]
@@ -387,18 +814,11 @@ mod tests {
         let events = store.get_events("sess-001", 10).unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "task_complete");
+        assert_eq!(events[0].detail["task"], "scan_repo");
     }
 
     #[test]
-    fn fingerprint_changed_detects_modification() {
-        let store = TraceStore::open_in_memory().unwrap();
-        assert!(store.fingerprint_changed("src/main.rs", 1000, 100));
-        assert!(!store.fingerprint_changed("src/main.rs", 1000, 100));
-        assert!(store.fingerprint_changed("src/main.rs", 1001, 100));
-    }
-
-    #[test]
-    fn save_and_search_decisions() {
+    fn save_and_search_decisions_escapes_wildcards() {
         let store = TraceStore::open_in_memory().unwrap();
         let dec = Decision {
             id: "0001".to_string(),
@@ -410,47 +830,47 @@ mod tests {
             created_at_ms: 1000,
             author: "hermes".to_string(),
             supersedes: None,
-            tags: vec!["storage".to_string()],
-            links: vec!["src/store.rs".to_string()],
+            tags: vec![],
+            links: vec![],
         };
         store.save_decision_cached(&dec).unwrap();
-        let results = store.search_cached_decisions("sqlite").unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Use SQLite");
-        let results2 = store.search_cached_decisions("embedded").unwrap();
-        assert_eq!(results2.len(), 1);
-        let results3 = store.search_cached_decisions("nonexistent").unwrap();
-        assert_eq!(results3.len(), 0);
+        assert_eq!(store.search_cached_decisions("sqlite").unwrap().len(), 1);
+        assert_eq!(store.search_cached_decisions("embedded").unwrap().len(), 1);
+        assert_eq!(
+            store
+                .search_cached_decisions("external server")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            store.search_cached_decisions("nonexistent").unwrap().len(),
+            0
+        );
+        assert_eq!(
+            store.search_cached_decisions("%").unwrap().len(),
+            0,
+            "% is literal"
+        );
     }
 
     #[test]
-    fn get_recent_history_returns_empty_for_empty_db() {
-        let store = TraceStore::open_in_memory().unwrap();
-        let history = store.get_recent_history(10).unwrap();
-        assert!(history.is_empty());
-    }
-
-    #[test]
-    fn prune_old_sessions() {
-        let store = TraceStore::open_in_memory().unwrap();
-        let old = SessionRecord {
-            session_id: "sess-old".to_string(),
-            timestamp_ms: 1000,
-            agent_name: "hermes".to_string(),
-            summary: "old session".to_string(),
-        };
-        let fresh = SessionRecord {
-            session_id: "sess-fresh".to_string(),
-            timestamp_ms: now_ms(),
-            agent_name: "hermes".to_string(),
-            summary: "fresh session".to_string(),
-        };
-        store.save_session(&old).unwrap();
-        store.save_session(&fresh).unwrap();
-        // Prune entries older than 1 hour
-        store.prune_history(3600_000).unwrap();
+    fn prune_removes_old_sessions_and_orphaned_files() {
+        let mut store = TraceStore::open_in_memory().unwrap();
+        store
+            .record_session(&session("old", 1000, "a"), &[touched("old", "x.rs", "r")])
+            .unwrap();
+        store
+            .record_session(
+                &session("fresh", now_ms(), "a"),
+                &[touched("fresh", "y.rs", "r")],
+            )
+            .unwrap();
+        assert_eq!(store.prune_history(3_600_000).unwrap(), 1);
         let history = store.get_recent_history(10).unwrap();
         assert_eq!(history.len(), 1);
-        assert_eq!(history[0].session_id, "sess-fresh");
+        assert_eq!(history[0].session_id, "fresh");
+        assert!(store.get_touched_files("old").unwrap().is_empty());
+        assert_eq!(store.get_touched_files("fresh").unwrap().len(), 1);
     }
 }
