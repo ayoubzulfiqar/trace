@@ -19,8 +19,8 @@
 <!-- Describe the tests that you ran to verify your changes -->
 
 - [ ] `cargo fmt --check`
-- [ ] `cargo clippy` — no warnings
-- [ ] `cargo test -- --test-threads=1` — all tests pass
+- [ ] `cargo clippy --all-targets -- -D warnings` — no warnings
+- [ ] `cargo test` — all tests pass
 - [ ] `cargo build` — compiles cleanly
 
 ## Checklist
