@@ -1,0 +1,25 @@
+# Enforce trace's architectural rules on every pull request.
+# Copy to .github/workflows/architecture.yml.
+name: Architecture
+
+on:
+  pull_request:
+
+jobs:
+  trace-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install trace
+        run: curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/trace/main/install.sh | TRACE_NO_SETUP=1 sh
+
+      # Whole repository (warnings fail too):
+      - name: Check all files
+        run: trace check --strict
+
+      # Or only the files this pull request changes:
+      # - name: Check changed files
+      #   run: git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD" | xargs -r trace check
