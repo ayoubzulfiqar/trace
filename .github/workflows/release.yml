@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: auto
+
+jobs:
+  build:
+    name: Build (${{ matrix.os_name }}, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os_name: linux
+            arch: x86_64
+            cross_linker: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-22.04
+            os_name: linux
+            arch: aarch64
+            cross_linker: aarch64-linux-gnu-gcc
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            os_name: macos
+            arch: x86_64
+            cross_linker: ""
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            os_name: macos
+            arch: aarch64
+            cross_linker: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross linker (Linux aarch64)
+        if: matrix.cross_linker != ""
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.cross_linker }}
+
+      - name: Package
+        run: |
+          tar czf "trace-${{ github.ref_name }}-${{ matrix.os_name }}-${{ matrix.arch }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" trace
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "trace-${{ matrix.os_name }}-${{ matrix.arch }}"
+          path: "trace-*.tar.gz"
+
+  release:
+    name: Create release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather packages
+        run: |
+          find artifacts -name '*.tar.gz' -exec mv {} . \;
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: '*.tar.gz'
