@@ -1,6 +1,6 @@
 [package]
 name = "trace"
-version = "1.6.9"
+version = "2.6.9"
 edition = "2021"
 rust-version = "1.90"
 description = "Architectural memory engine — an MCP server for codebase structure (symbols, call graph, imports, routes), architectural guardrails, decision records and session memory"
