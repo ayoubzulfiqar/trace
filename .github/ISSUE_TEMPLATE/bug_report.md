@@ -25,17 +25,22 @@ A clear and concise description of what actually happened.
 
 ## Environment
 
-- OS: [e.g. Ubuntu 22.04, macOS 14, Windows 11]
-- Rust version: [e.g. 1.80.0]
-- trace version: [e.g. 0.1.0, or "built from source"]
+- OS / distribution: [e.g. Fedora 44, Ubuntu 24.04, macOS 15, Windows 11]
+- trace version (`trace --version`): [e.g. 2.6.9]
+- Installed via: [installer / .deb / .rpm / Arch package / cargo install / source]
+- AI agent and version, if relevant: [e.g. Claude Code 2.x, Cursor, Codex CLI]
 
-## Context
+## Diagnostics
 
-```bash
-trace scan /path/to/project
+Output of `trace status --json` from the project root:
+
+```json
 ```
 
-Paste the output or relevant error message here.
+Relevant lines from the daemon log (`~/.trace/project-<id>/daemon.log`), or the output of the failing command:
+
+```
+```
 
 ## Additional context
 
