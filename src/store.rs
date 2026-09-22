@@ -74,6 +74,9 @@ impl TraceStore {
     pub fn open(path: &std::path::Path) -> SqlResult<Self> {
         std::fs::create_dir_all(path.parent().unwrap_or_else(|| std::path::Path::new("."))).ok();
         let conn = Connection::open(path)?;
+        // WAL mode for concurrent read/write access from multiple agent shims
+        conn.pragma_update(None, "journal_mode", &"WAL")?;
+        conn.pragma_update(None, "synchronous", &"NORMAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(TraceStore { conn })
     }
