@@ -1,7 +1,10 @@
 # Rust build artifacts
 target/
 
-# Runtime state (created by `trace scan` and `trace serve`)
+# Packaging output (packaging/build-package.sh)
+dist/
+
+# Runtime state (created by `trace scan` / `trace serve`)
 .trace/
 
 # Database files
