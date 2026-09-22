@@ -34,18 +34,22 @@ pub struct Evidence {
 pub struct RelPath(pub String);
 
 impl RelPath {
-    pub fn path(&self) -> &str { &self.0 }
+    pub fn path(&self) -> &str {
+        &self.0
+    }
 }
 
 impl std::fmt::Display for RelPath {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { write!(f, "{}", self.0) }
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
 }
 
 // ── Structural symbol model (Phase 1 output, re-exported from structural.rs) ─
 
 pub use crate::structural::{
-    CallEdge, Import, ObservationSource, Route, STRUCTURAL_EXTRACTOR_VERSION,
-    StructuralFileFacts, StructuralGraph, Symbol, SymbolKind,
+    CallEdge, Import, ObservationSource, Route, StructuralFileFacts, StructuralGraph, Symbol,
+    SymbolKind, STRUCTURAL_EXTRACTOR_VERSION,
 };
 
 // ── Index (Phase 1 + Phase 4) ──────────────────────────────────────────────────
