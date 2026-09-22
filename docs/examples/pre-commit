@@ -1,0 +1,20 @@
+#!/bin/sh
+# Git pre-commit hook: block commits that break the project's architectural
+# rules. Install with:
+#   cp docs/examples/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+# Bypass once with `git commit --no-verify`.
+set -eu
+
+command -v trace >/dev/null 2>&1 || {
+    echo "pre-commit: trace not installed; skipping architecture check" >&2
+    exit 0
+}
+
+files="$(git diff --cached --name-only --diff-filter=ACMR)"
+[ -n "$files" ] || exit 0
+
+# One path per line: split on newlines only.
+IFS='
+'
+# shellcheck disable=SC2086 # word splitting is intended
+exec trace check $files
