@@ -1,80 +1,114 @@
 //! System service integration.
 //!
-//! Generates and manages platform-native service definitions so the trace
-//! daemon can run as a persistent background process:
+//! Generates and manages a per-project platform service so the trace daemon
+//! for that project starts at login and restarts on failure:
 //!
-//! - Linux: systemd user service (`~/.config/systemd/user/trace.service`)
-//! - macOS: launchd plist (`~/Library/LaunchAgents/com.trace.daemon.plist`)
+//! - Linux: systemd user unit `~/.config/systemd/user/trace-<id>.service`
+//! - macOS: launchd agent `~/Library/LaunchAgents/com.trace.daemon.<id>.plist`
 //!
-//! The service runs `trace daemon <project-root>` — a long-lived Unix socket
-//! listener that all `trace serve` shims connect to, avoiding duplicated
-//! per-agent process overhead.
+//! `<id>` is derived from the project root, so several projects can each have
+//! their own service. The service runs `trace daemon --idle-timeout 0 <root>`
+//! (never idles out; the service manager owns its lifetime).
 
-use anyhow::{Context, Result};
+use crate::daemon::{paths_for_root, project_id};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A platform service manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServiceManager {
     Systemd,
-    #[cfg(target_os = "macos")]
     Launchd,
     Unsupported,
 }
 
 fn detect_service_manager() -> ServiceManager {
-    #[cfg(target_os = "linux")]
-    {
-        if Path::new("/run/systemd/system").exists() {
-            return ServiceManager::Systemd;
+    if cfg!(target_os = "linux") && Path::new("/run/systemd/system").exists() {
+        ServiceManager::Systemd
+    } else if cfg!(target_os = "macos") {
+        ServiceManager::Launchd
+    } else {
+        ServiceManager::Unsupported
+    }
+}
+
+fn short_id(root: &Path) -> String {
+    project_id(root)[..12].to_string()
+}
+
+fn systemd_unit_name(root: &Path) -> String {
+    format!("trace-{}.service", short_id(root))
+}
+
+fn launchd_label(root: &Path) -> String {
+    format!("com.trace.daemon.{}", short_id(root))
+}
+
+/// Quote one ExecStart argument for systemd: double quotes with C escapes,
+/// and `%`/`$` doubled so they are not expanded as specifiers/variables.
+fn systemd_quote(arg: &str) -> String {
+    let mut out = String::from("\"");
+    for ch in arg.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '%' => out.push_str("%%"),
+            '$' => out.push_str("$$"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
         }
     }
-    #[cfg(target_os = "macos")]
-    {
-        if Path::new("/System/Library/LaunchDaemons").exists() {
-            return ServiceManager::Launchd;
-        }
-    }
-    ServiceManager::Unsupported
+    out.push('"');
+    out
 }
 
 /// Generate the systemd unit file content for the trace daemon.
 fn systemd_unit(root: &Path, exe: &Path) -> String {
+    let root_str = root.display().to_string();
     format!(
         "[Unit]\n\
-Description=Trace Architectural Memory Engine Daemon\n\
-After=network.target\n\
+Description=trace architectural memory daemon for {desc}\n\
 \n\
 [Service]\n\
 Type=simple\n\
-ExecStart={} daemon {}\n\
-WorkingDirectory={}\n\
+ExecStart={exe} daemon --idle-timeout 0 {root}\n\
+WorkingDirectory={workdir}\n\
 Restart=on-failure\n\
 RestartSec=5\n\
-Environment=RUST_LOG=info\n\
 \n\
 [Install]\n\
 WantedBy=default.target\n",
-        exe.display(),
-        root.display(),
-        root.display()
+        desc = root_str.replace('%', "%%"),
+        exe = systemd_quote(&exe.display().to_string()),
+        root = systemd_quote(&root_str),
+        workdir = root_str.replace('%', "%%"),
     )
 }
 
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Generate the launchd plist content for the trace daemon.
-#[cfg(target_os = "macos")]
-fn launchd_plist(root: &Path, exe: &Path) -> String {
+fn launchd_plist(root: &Path, exe: &Path, label: &str, log: &Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.trace.daemon</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
         <string>{exe}</string>
         <string>daemon</string>
+        <string>--idle-timeout</string>
+        <string>0</string>
         <string>{root}</string>
     </array>
     <key>RunAtLoad</key>
@@ -83,120 +117,280 @@ fn launchd_plist(root: &Path, exe: &Path) -> String {
     <true/>
     <key>WorkingDirectory</key>
     <string>{root}</string>
+    <key>StandardErrorPath</key>
+    <string>{log}</string>
 </dict>
 </plist>
 "#,
-        exe = exe.display(),
-        root = root.display()
+        label = xml_escape(label),
+        exe = xml_escape(&exe.display().to_string()),
+        root = xml_escape(&root.display().to_string()),
+        log = xml_escape(&log.display().to_string()),
     )
 }
 
-/// Resolve the trace binary path.
-fn resolve_binary() -> Result<PathBuf> {
-    std::env::current_exe().context("cannot determine trace executable path")
+fn systemd_unit_path(root: &Path) -> Result<PathBuf> {
+    Ok(dirs::config_dir()
+        .context("cannot find the config directory")?
+        .join("systemd/user")
+        .join(systemd_unit_name(root)))
 }
 
-/// Install the trace daemon as a system service.
-pub fn install(project_root: &Path) -> Result<()> {
-    let exe = resolve_binary()?;
-    let manager = detect_service_manager();
+fn launchd_plist_path(root: &Path) -> Result<PathBuf> {
+    Ok(dirs::home_dir()
+        .context("cannot find the home directory")?
+        .join("Library/LaunchAgents")
+        .join(format!("{}.plist", launchd_label(root))))
+}
 
-    match manager {
-        ServiceManager::Systemd => {
-            install_systemd(project_root, &exe)?;
-            println!("trace daemon registered with systemd");
+/// Run a command, returning whether it succeeded and its combined output.
+fn run(program: &str, args: &[&str]) -> Result<(bool, String)> {
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .with_context(|| format!("running {program}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
         }
-        #[cfg(target_os = "macos")]
-        ServiceManager::Launchd => {
-            install_launchd(project_root, &exe)?;
-            println!("trace daemon registered with launchd");
-        }
-        ServiceManager::Unsupported => {
-            println!("⚠  No supported service manager found (systemd or launchd).");
-            println!("  The trace daemon can still be run manually:");
-            println!("    {} daemon {}", exe.display(), project_root.display());
-            println!("  Or started from a terminal multiplexer (tmux/screen) for persistence.");
+        text.push_str(&err);
+    }
+    Ok((output.status.success(), text))
+}
+
+fn systemctl(args: &[&str]) -> Result<()> {
+    let mut full = vec!["--user"];
+    full.extend_from_slice(args);
+    let (ok, out) = run("systemctl", &full)?;
+    if ok {
+        Ok(())
+    } else {
+        Err(anyhow!("systemctl --user {} failed: {out}", args.join(" ")))
+    }
+}
+
+fn current_uid() -> Result<String> {
+    let (ok, out) = run("id", &["-u"])?;
+    if ok && !out.is_empty() {
+        Ok(out)
+    } else {
+        Err(anyhow!("cannot determine the current user id"))
+    }
+}
+
+fn resolve_binary() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("cannot determine trace executable path")?;
+    Ok(exe.canonicalize().unwrap_or(exe))
+}
+
+/// Install (and start) the trace daemon service for `project_root`.
+pub fn install(project_root: &Path) -> Result<()> {
+    if crate::root::is_broad_root(project_root) {
+        return Err(anyhow!(
+            "refusing to install a service for {}: pass a project directory (`trace service install /path/to/project`)",
+            project_root.display()
+        ));
+    }
+    let exe = resolve_binary()?;
+    // Unit files and plists are line-oriented: a newline in a path would
+    // inject directives.
+    for path in [project_root, exe.as_path()] {
+        if path.to_string_lossy().chars().any(char::is_control) {
+            return Err(anyhow!(
+                "refusing to install a service for a path containing control characters: {:?}",
+                path
+            ));
         }
     }
-
-    Ok(())
-}
-
-fn install_systemd(root: &Path, exe: &Path) -> Result<()> {
-    let unit = systemd_unit(root, exe);
-    let config_dir = dirs::config_dir()
-        .context("cannot find config directory")?
-        .join("systemd/user");
-    std::fs::create_dir_all(&config_dir).context("creating systemd user config dir")?;
-
-    let unit_path = config_dir.join("trace.service");
-    std::fs::write(&unit_path, unit).context("writing systemd unit file")?;
-
-    // Reload systemd user daemon
-    let _ = Command::new("systemctl")
-        .args(&["--user", "daemon-reload"])
-        .status()
-        .context("reloading systemd user daemon");
-
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-fn install_launchd(root: &Path, exe: &Path) -> Result<()> {
-    let plist = launchd_plist(root, exe);
-    let agents_dir = dirs::home_dir()
-        .context("cannot find home directory")?
-        .join("Library/LaunchAgents");
-    std::fs::create_dir_all(&agents_dir).context("creating LaunchAgents dir")?;
-
-    let plist_path = agents_dir.join("com.trace.daemon.plist");
-    std::fs::write(&plist_path, plist).context("writing launchd plist")?;
-
-    Ok(())
-}
-
-/// Remove the trace daemon service definition.
-pub fn uninstall() -> Result<()> {
-    let manager = detect_service_manager();
-
-    match manager {
+    let running = crate::daemon::daemon_status(project_root);
+    match detect_service_manager() {
         ServiceManager::Systemd => {
-            let unit_path = dirs::config_dir()
-                .context("cannot find config directory")?
-                .join("systemd/user/trace.service");
-            if unit_path.exists() {
-                std::fs::remove_file(&unit_path).context("removing systemd unit file")?;
-                let _ = Command::new("systemctl")
-                    .args(&["--user", "daemon-reload"])
-                    .status();
-                println!("✓ trace service removed from systemd");
-            } else {
-                println!("trace service not found in systemd configuration");
-            }
+            let unit_path = systemd_unit_path(project_root)?;
+            std::fs::create_dir_all(unit_path.parent().unwrap())
+                .context("creating the systemd user unit dir")?;
+            std::fs::write(&unit_path, systemd_unit(project_root, &exe))
+                .context("writing the systemd unit")?;
+            systemctl(&["daemon-reload"])?;
+            let unit = systemd_unit_name(project_root);
+            systemctl(&["enable", &unit])?;
+            // restart (not start) so a reinstall after an upgrade runs the new binary.
+            systemctl(&["restart", &unit])?;
+            println!("✓ {unit} installed and started ({})", unit_path.display());
+            println!("  Logs: journalctl --user -u {unit}");
+            println!("  To keep it running while logged out: loginctl enable-linger $USER");
         }
-        #[cfg(target_os = "macos")]
         ServiceManager::Launchd => {
-            let plist_path = dirs::home_dir()
-                .context("cannot find home directory")?
-                .join("Library/LaunchAgents/com.trace.daemon.plist");
-            if plist_path.exists() {
-                let _ = Command::new("launchctl")
-                    .args(&[
-                        "bootout",
-                        "gui/$(id -u)",
-                        &plist_path.to_string_lossy().to_string(),
-                    ])
-                    .status();
-                std::fs::remove_file(&plist_path).context("removing launchd plist")?;
-                println!("✓ trace service removed from launchd");
-            } else {
-                println!("trace service not found in launchd configuration");
+            let plist_path = launchd_plist_path(project_root)?;
+            std::fs::create_dir_all(plist_path.parent().unwrap())
+                .context("creating LaunchAgents")?;
+            let label = launchd_label(project_root);
+            let log = paths_for_root(project_root).log;
+            if let Some(dir) = log.parent() {
+                std::fs::create_dir_all(dir)?;
             }
+            std::fs::write(&plist_path, launchd_plist(project_root, &exe, &label, &log))
+                .context("writing the launchd plist")?;
+            let uid = current_uid()?;
+            let _ = run("launchctl", &["bootout", &format!("gui/{uid}/{label}")]);
+            let (ok, out) = run(
+                "launchctl",
+                &[
+                    "bootstrap",
+                    &format!("gui/{uid}"),
+                    &plist_path.to_string_lossy(),
+                ],
+            )?;
+            if !ok {
+                return Err(anyhow!("launchctl bootstrap failed: {out}"));
+            }
+            println!("✓ {label} installed and started ({})", plist_path.display());
+            println!("  Logs: {}", log.display());
+        }
+        ServiceManager::Unsupported => {
+            println!("⚠  No supported service manager found (systemd user session or launchd).");
+            println!("  Run the daemon manually, or let `trace serve` start it on demand:");
+            println!("    {} daemon {}", exe.display(), project_root.display());
+            return Ok(());
+        }
+    }
+    if let (true, Some(pid)) = (running.running, running.pid) {
+        println!(
+            "  Note: an on-demand daemon (pid {pid}) is serving this project; the service takes over \
+             when it exits (after 30 idle minutes), or hand over now with `kill {pid}`."
+        );
+    }
+    Ok(())
+}
+
+/// Stop and remove the trace daemon service for `project_root`.
+pub fn uninstall(project_root: &Path) -> Result<()> {
+    match detect_service_manager() {
+        ServiceManager::Systemd => {
+            let unit = systemd_unit_name(project_root);
+            let unit_path = systemd_unit_path(project_root)?;
+            if !unit_path.exists() {
+                println!("No trace service installed for {}", project_root.display());
+                return Ok(());
+            }
+            let _ = systemctl(&["disable", "--now", &unit]);
+            std::fs::remove_file(&unit_path).context("removing the systemd unit")?;
+            let _ = systemctl(&["daemon-reload"]);
+            println!("✓ {unit} stopped and removed");
+        }
+        ServiceManager::Launchd => {
+            let plist_path = launchd_plist_path(project_root)?;
+            if !plist_path.exists() {
+                println!("No trace service installed for {}", project_root.display());
+                return Ok(());
+            }
+            let label = launchd_label(project_root);
+            if let Ok(uid) = current_uid() {
+                let _ = run("launchctl", &["bootout", &format!("gui/{uid}/{label}")]);
+            }
+            std::fs::remove_file(&plist_path).context("removing the launchd plist")?;
+            println!("✓ {label} stopped and removed");
         }
         ServiceManager::Unsupported => {
             println!("No supported service manager found; nothing to uninstall.");
         }
     }
-
     Ok(())
+}
+
+/// Report whether the project's service is installed and active.
+pub fn status(project_root: &Path) -> Result<()> {
+    match detect_service_manager() {
+        ServiceManager::Systemd => {
+            let unit = systemd_unit_name(project_root);
+            let installed = systemd_unit_path(project_root)?.exists();
+            let (_, state) = run("systemctl", &["--user", "is-active", &unit])?;
+            println!(
+                "{unit}: {} ({state})",
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                }
+            );
+        }
+        ServiceManager::Launchd => {
+            let label = launchd_label(project_root);
+            let installed = launchd_plist_path(project_root)?.exists();
+            let loaded = current_uid()
+                .and_then(|uid| run("launchctl", &["print", &format!("gui/{uid}/{label}")]))
+                .map(|(ok, _)| ok)
+                .unwrap_or(false);
+            println!(
+                "{label}: {}, {}",
+                if installed {
+                    "installed"
+                } else {
+                    "not installed"
+                },
+                if loaded { "loaded" } else { "not loaded" }
+            );
+        }
+        ServiceManager::Unsupported => println!("No supported service manager on this platform."),
+    }
+    let daemon = crate::daemon::daemon_status(project_root);
+    println!(
+        "daemon: {}",
+        if daemon.running {
+            "running"
+        } else {
+            "not running"
+        }
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_quotes_paths_and_escapes_specifiers() {
+        let unit = systemd_unit(
+            Path::new("/home/me/my project/100%"),
+            Path::new("/opt/trace bin/trace"),
+        );
+        assert!(unit.contains(r#"ExecStart="/opt/trace bin/trace" daemon --idle-timeout 0 "/home/me/my project/100%%""#), "{unit}");
+        assert!(unit.contains("WorkingDirectory=/home/me/my project/100%%"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(!unit.contains("RUST_LOG"));
+    }
+
+    #[test]
+    fn systemd_quote_escapes() {
+        assert_eq!(systemd_quote(r#"a"b\c$d"#), r#""a\"b\\c$$d""#);
+    }
+
+    #[test]
+    fn plist_escapes_xml() {
+        let plist = launchd_plist(
+            Path::new("/Users/me/R&D <x>"),
+            Path::new("/usr/local/bin/trace"),
+            "com.trace.daemon.abc",
+            Path::new("/tmp/log"),
+        );
+        assert!(plist.contains("<string>/Users/me/R&amp;D &lt;x&gt;</string>"));
+        assert!(plist.contains("<string>--idle-timeout</string>"));
+        assert!(!plist.contains("$(id -u)"));
+    }
+
+    #[test]
+    fn names_are_per_project() {
+        let a = systemd_unit_name(Path::new("/nonexistent/a"));
+        let b = systemd_unit_name(Path::new("/nonexistent/b"));
+        assert_ne!(a, b);
+        assert!(a.starts_with("trace-") && a.ends_with(".service"));
+        assert!(launchd_label(Path::new("/nonexistent/a")).starts_with("com.trace.daemon."));
+    }
+
+    #[test]
+    fn broad_roots_are_refused() {
+        assert!(install(Path::new("/")).is_err());
+    }
 }
