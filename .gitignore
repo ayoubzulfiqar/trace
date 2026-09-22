@@ -1,0 +1,18 @@
+# Rust build artifacts
+target/
+
+# Runtime state (created by `trace scan` and `trace serve`)
+.trace/
+
+# Database files
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
