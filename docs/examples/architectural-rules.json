@@ -1,0 +1,71 @@
+{
+  "rules": [
+    {
+      "id": "layering-controllers",
+      "target_path": "src/controllers/**",
+      "forbidden_imports": [
+        "src/db",
+        "crate::db",
+        "app.db"
+      ],
+      "message": "Controllers talk to services, never to the database.",
+      "severity": "deny"
+    },
+    {
+      "id": "no-shell-out",
+      "target_path": [
+        "src/**",
+        "app/**"
+      ],
+      "exclude_paths": "src/tools/**",
+      "forbidden_symbols": [
+        "child_process.exec",
+        "subprocess.run",
+        "std::process::Command"
+      ],
+      "message": "Spawning processes is only allowed in src/tools.",
+      "severity": "deny"
+    },
+    {
+      "id": "http-client-wrapper-rust",
+      "target_path": "src/services/**/*.rs",
+      "forbidden_symbols": [
+        "reqwest::Client"
+      ],
+      "required_imports": [
+        "crate::http"
+      ],
+      "message": "Use the shared HTTP client (retries, tracing, auth).",
+      "severity": "warn"
+    },
+    {
+      "id": "http-client-wrapper-ts",
+      "target_path": "src/services/**/*.ts",
+      "forbidden_imports": [
+        "axios"
+      ],
+      "message": "Use src/lib/http instead of axios directly.",
+      "severity": "warn"
+    },
+    {
+      "id": "applied-migrations",
+      "target_path": "migrations",
+      "frozen": true,
+      "message": "Applied migrations are immutable; add a new one."
+    },
+    {
+      "id": "no-print-debugging",
+      "target_path": "src/**",
+      "exclude_paths": [
+        "src/bin/**",
+        "**/tests/**"
+      ],
+      "forbidden_symbols": [
+        "dbg",
+        "console.log"
+      ],
+      "message": "Use the logger.",
+      "severity": "info"
+    }
+  ]
+}
