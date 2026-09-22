@@ -1,31 +1,9 @@
-//! The fact model — what trace is allowed to know.
+//! Shared data model — paths, decisions and execution-memory records.
 //!
-//! Every answer carries its evidence, and every piece of evidence is labelled
-//! with its strength:
-//!
-//!   DECLARED — read from a schema declaration. The project itself asserts this.
-//!   USED     — observed in source as a real access. The code demonstrably
-//!              touches it.
-//!   NAMED    — name resemblance only. The weakest tier, and it says so.
+//! Structural facts (symbols, imports, call edges, routes) live in
+//! `structural.rs` and are re-exported here for convenience.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-
-/// Evidence tiers — structured domain only (code, schema, infra).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
-    Declared,
-    Used,
-    Named,
-}
-
-/// One piece of evidence — a fact with its strength label.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Evidence {
-    pub tier: Tier,
-    /// Human-readable statement of the fact, always naming its source file.
-    pub what: String,
-}
 
 // ── RelPath (a path relative to the project root) ──────────────────────────────
 
@@ -34,6 +12,10 @@ pub struct Evidence {
 pub struct RelPath(pub String);
 
 impl RelPath {
+    pub fn new(path: &str) -> Self {
+        RelPath(normalize_rel(path))
+    }
+
     pub fn path(&self) -> &str {
         &self.0
     }
@@ -45,67 +27,24 @@ impl std::fmt::Display for RelPath {
     }
 }
 
-// ── Structural symbol model (Phase 1 output, re-exported from structural.rs) ─
+/// Normalise a relative path: forward slashes, no `.`/empty segments, no
+/// leading `./`. `..` segments are preserved — escaping the root is checked
+/// separately by `root::resolve_in_root`.
+pub fn normalize_rel(path: &str) -> String {
+    let unified = path.trim().replace('\\', "/");
+    unified
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+// ── Structural symbol model (re-exported from structural.rs) ───────────────────
 
 pub use crate::structural::{
-    CallEdge, Import, ObservationSource, Route, StructuralFileFacts, StructuralGraph, Symbol,
+    CallEdge, FileFacts, Import, IndexedFile, ObservationSource, Route, StructuralGraph, Symbol,
     SymbolKind, STRUCTURAL_EXTRACTOR_VERSION,
 };
-
-// ── Index (Phase 1 + Phase 4) ──────────────────────────────────────────────────
-
-/// Everything the scan learned about one repository — the schema/concept layer
-/// plus decisions (Phase 3) and execution state.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Index {
-    pub root: String,
-    pub files_scanned: usize,
-    /// Per-file extraction cache: the incremental engine.
-    #[serde(default)]
-    pub file_facts: BTreeMap<String, FileFacts>,
-    /// archietect.toml [aliases]: concept term → the concept that implements it.
-    #[serde(default)]
-    pub aliases: BTreeMap<String, String>,
-    /// Archietect.toml [[decision]] entries — these are the ADRs (Phase 3).
-    #[serde(default)]
-    pub decisions: Vec<Decision>,
-    /// Paths excluded from scanning.
-    #[serde(default)]
-    pub excludes: Vec<String>,
-    #[serde(default)]
-    pub extractor_version: u32,
-    /// Signature of the concept set — if a rescan changes it, all usage is
-    /// invalid.
-    #[serde(default)]
-    pub concepts_sig: String,
-}
-
-/// What one file contributed, cached against (size, mtime, extractor version).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FileFacts {
-    pub size: u64,
-    pub mtime_ms: i64,
-    /// Declaration fragments this file asserts.
-    #[serde(default)]
-    pub decls: Vec<DeclFragment>,
-    /// (concept, access-kind) usage hits observed in this file.
-    #[serde(default)]
-    pub usage: Vec<(String, String)>,
-    #[serde(default)]
-    pub decl_kinds: Vec<String>,
-}
-
-/// One file's assertion about one concept.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct DeclFragment {
-    pub name: String,
-    pub kind: String,
-    #[serde(default)]
-    pub fields: Vec<String>,
-    #[serde(default)]
-    pub relations: Vec<String>,
-    pub table: Option<String>,
-}
 
 // ── ADR model (Phase 3) ────────────────────────────────────────────────────────
 
@@ -114,7 +53,7 @@ pub struct DeclFragment {
 pub struct Decision {
     pub id: String,
     pub title: String,
-    /// Lifecycle state: accepted / superseded / rejected / retired.
+    /// Lifecycle state.
     #[serde(default)]
     pub status: DecisionStatus,
     pub context: String,
@@ -137,96 +76,71 @@ pub struct Decision {
     pub links: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum DecisionStatus {
+    Proposed,
     #[default]
     Accepted,
     Superseded,
+    Deprecated,
     Rejected,
     Retired,
+}
+
+impl DecisionStatus {
+    pub const ALL: &'static [DecisionStatus] = &[
+        DecisionStatus::Proposed,
+        DecisionStatus::Accepted,
+        DecisionStatus::Superseded,
+        DecisionStatus::Deprecated,
+        DecisionStatus::Rejected,
+        DecisionStatus::Retired,
+    ];
 }
 
 impl std::str::FromStr for DecisionStatus {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "accepted" | "active" => Ok(Self::Accepted),
-            "superseded" => Ok(Self::Superseded),
-            "rejected" => Ok(Self::Rejected),
+        // Only the leading word counts: "Superseded by [3. Use X](...)".
+        let word = value
+            .trim()
+            .split(|c: char| !c.is_alphabetic())
+            .find(|w| !w.is_empty())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match word.as_str() {
+            "proposed" | "draft" | "pending" => Ok(Self::Proposed),
+            "accepted" | "active" | "approved" | "adopted" => Ok(Self::Accepted),
+            "superseded" | "replaced" => Ok(Self::Superseded),
+            "deprecated" | "obsolete" => Ok(Self::Deprecated),
+            "rejected" | "declined" => Ok(Self::Rejected),
             "retired" => Ok(Self::Retired),
-            other => Err(format!("unknown decision status {other:?}")),
+            _ => Err(format!(
+                "unknown decision status {value:?} (expected proposed, accepted, superseded, deprecated, rejected or retired)"
+            )),
         }
     }
 }
 
 impl std::fmt::Display for DecisionStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            DecisionStatus::Accepted => write!(f, "Accepted"),
-            DecisionStatus::Superseded => write!(f, "Superseded"),
-            DecisionStatus::Rejected => write!(f, "Rejected"),
-            DecisionStatus::Retired => write!(f, "Retired"),
-        }
+        f.write_str(match self {
+            DecisionStatus::Proposed => "Proposed",
+            DecisionStatus::Accepted => "Accepted",
+            DecisionStatus::Superseded => "Superseded",
+            DecisionStatus::Deprecated => "Deprecated",
+            DecisionStatus::Rejected => "Rejected",
+            DecisionStatus::Retired => "Retired",
+        })
     }
-}
-
-// ── Constraint rule model (Phase 2) ────────────────────────────────────────────
-
-/// A single architectural invariant rule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Rule {
-    pub id: String,
-    /// Glob pattern for files the rule applies to (e.g. "src/controllers/*").
-    pub target_path: String,
-    /// Imports that are forbidden in matching files.
-    #[serde(default)]
-    pub forbidden_imports: Vec<String>,
-    /// Imports that are required in matching files.
-    #[serde(default)]
-    pub required_imports: Vec<String>,
-    /// Human-readable explanation of the rule.
-    pub message: String,
-    /// Severity: "error" (block) or "warning" (advisory).
-    #[serde(default)]
-    pub severity: RuleSeverity,
-    /// Tags for categorization.
-    #[serde(default)]
-    pub tags: Vec<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum RuleSeverity {
-    #[default]
-    Error,
-    Warning,
-}
-
-/// The rules file schema: `.architectural-rules.json`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct RulesConfig {
-    #[serde(default)]
-    pub rules: Vec<Rule>,
-}
-
-/// One violation found when evaluating a plan.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Violation {
-    pub rule_id: String,
-    pub severity: RuleSeverity,
-    pub message: String,
-    /// The file that would violate the rule.
-    pub file: String,
-    /// The specific forbidden import or missing required import.
-    pub detail: String,
 }
 
 // ── Session / execution memory (Phase 4) ───────────────────────────────────────
 
 /// A session record in the execution-memory log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionRecord {
     pub session_id: String,
     pub timestamp_ms: i64,
@@ -235,7 +149,7 @@ pub struct SessionRecord {
 }
 
 /// A touched-file record in the execution-memory log.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TouchedFileRecord {
     pub session_id: String,
     pub file_path: String,
@@ -250,4 +164,29 @@ pub struct HistoricalEvent {
     pub agent_name: String,
     pub event_type: String,
     pub detail: serde_json::Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_rel_cleans_separators_and_dots() {
+        assert_eq!(normalize_rel("./src//lib.rs"), "src/lib.rs");
+        assert_eq!(normalize_rel("src\\a\\b.rs"), "src/a/b.rs");
+        assert_eq!(normalize_rel(" src/./x.ts "), "src/x.ts");
+        assert_eq!(normalize_rel("../outside"), "../outside");
+    }
+
+    #[test]
+    fn decision_status_parses_leading_word_and_aliases() {
+        assert_eq!("accepted".parse(), Ok(DecisionStatus::Accepted));
+        assert_eq!("Proposed".parse(), Ok(DecisionStatus::Proposed));
+        assert_eq!(
+            "Superseded by [3. Use Postgres](0003-use-postgres.md)".parse(),
+            Ok(DecisionStatus::Superseded)
+        );
+        assert_eq!("deprecated".parse(), Ok(DecisionStatus::Deprecated));
+        assert!("banana".parse::<DecisionStatus>().is_err());
+    }
 }
