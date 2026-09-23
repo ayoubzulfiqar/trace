@@ -32,6 +32,8 @@ Restart your agent. It now has 16 trace tools; see [Telling agents to use trace]
   - A file whose `(mtime, size)` is unchanged is never read. A touched-but-identical file is hashed but not re-parsed. Changed files are parsed in parallel.
   - The index is cached in SQLite, so a restarted server re-parses only what changed while it was down.
   - The server refreshes before queries, so there is no stale index and no manual rescans.
+  - The cache is per project (`<root>/.trace/trace.db`), one row per file: re-indexing replaces entries instead of stacking them, deleted files drop out, and the file is compacted when a project shrinks.
+  - It rebuilds itself when it cannot be trusted — a new extractor version, an unreadable entry, or a corrupt database (moved aside, then recreated). `trace scan --reset` forces a clean rebuild.
 - **Scale:** on a 23,000-file / 800 MB corpus (1.3M symbols, 1.8M call edges), a cold index takes ~17 s on 12 cores (parse plus persist), a warm restart about 1 s, and an incremental refresh ~60 ms.
 
 ### Architectural guardrails
@@ -187,7 +189,7 @@ Paths are relative to the project root; absolute paths inside the project are ac
 |---|---|
 | `trace serve [root] [--inline]` | MCP over stdio through the shared daemon (`--inline`: in-process) |
 | `trace daemon [root] [--idle-timeout SECS]` | Run the per-project daemon (Unix) |
-| `trace scan [root] [--full] [--json]` | Index incrementally and print statistics |
+| `trace scan [root] [--full] [--reset] [--json]` | Index incrementally; `--full` re-parses everything, `--reset` rebuilds the cache from scratch |
 | `trace check [files…] [--root R] [--strict] [--json]` | Enforce rules; exit 1 on blocking violations (`--strict`: warnings too) |
 | `trace status [root] [--json]` | Root, index, rules, decisions, sessions and daemon state |
 | `trace setup [--dry-run] [--remove] [--root R]` | Register with agents |
