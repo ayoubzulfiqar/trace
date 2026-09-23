@@ -6,7 +6,7 @@ An architectural memory engine for AI coding agents, served over the [Model Cont
 
 Everything is deterministic and offline: no API keys, no network, no LLM inside.
 
-**Documentation:** [Usage guide](docs/USAGE.md) · [Changelog](CHANGELOG.md) · [Examples](docs/examples/) · `man trace`
+**Documentation:** [Docs index](docs/README.md) · [Getting started](docs/USAGE.md) · [Tools](docs/tools.md) · [CLI](docs/cli.md) · [Rules](docs/rules.md) · [Changelog](CHANGELOG.md) · `man trace`
 
 ## Quick start
 
@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/ayoubzulfiqar/trace/main/install.sh
 cd ~/code/my-app && trace status                                                         # what trace sees in a project
 ```
 
-Restart your agent. It now has 16 trace tools; see [Telling agents to use trace](docs/USAGE.md#telling-agents-to-use-trace).
+Restart your agent. It now has 16 trace tools; see [Telling agents to use trace](docs/agents.md#6-telling-agents-to-use-trace).
 
 ## Features
 
@@ -198,7 +198,7 @@ Paths are relative to the project root; absolute paths inside the project are ac
 | `trace completions <shell>` | Shell completion script (bash, zsh, fish, elvish, powershell) |
 | `trace man` | Print the man page |
 
-`trace check` exits 0 when the plan is allowed, 1 on blocking violations, and 2 on usage or runtime errors. The [usage guide](docs/USAGE.md#9-cli-reference) has every option, with examples.
+`trace check` exits 0 when the plan is allowed, 1 on blocking violations, and 2 on usage or runtime errors. The [CLI reference](docs/cli.md) has every option, with examples.
 
 Without `root`, trace uses `$TRACE_ROOT`, else walks up from the current directory. The first match wins in this order: a directory with `trace.toml` or `.architectural-rules.json`, then a VCS root (`.git`, `.hg`, `.jj`, `.svn`), then the nearest manifest (`Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, …). Monorepos are therefore indexed as one project.
 
@@ -241,7 +241,7 @@ Without `root`, trace uses `$TRACE_ROOT`, else walks up from the current directo
 | `severity` | `deny` (default) \| `warn` \| `info` |
 | `message` | Shown with every violation |
 
-The same schema works in YAML, or as `[[rules]]` tables in `trace.toml`. See the [rules cookbook](docs/USAGE.md#6-architectural-rules) and [`docs/examples/architectural-rules.json`](docs/examples/architectural-rules.json).
+The same schema works in YAML, or as `[[rules]]` tables in `trace.toml`. See the [rules guide and cookbook](docs/rules.md) and [`docs/examples/architectural-rules.json`](docs/examples/architectural-rules.json).
 
 ### Ignoring files
 
@@ -269,12 +269,12 @@ trace skips everything in `.gitignore`/`.ignore`, hidden directories, common bui
 cp docs/examples/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
 ```
 
-More setups (changed files only, GitLab, the pre-commit framework): [CI and git hooks](docs/USAGE.md#10-ci-and-git-hooks).
+More setups (changed files only, GitLab, the pre-commit framework): [Use cases and recipes](docs/workflows.md#5-enforce-rules-in-ci).
 
 ## Architecture
 
 ```
-docs/USAGE.md                complete usage guide; docs/examples/ has rules, CI and hook examples
+docs/                        documentation (start at docs/README.md); docs/examples/ has rules, CI and hook files
 packaging/                   build-package.sh (deb/rpm/arch) and the Arch PKGBUILD
 install.sh                   POSIX installer
 src/
