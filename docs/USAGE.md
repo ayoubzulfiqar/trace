@@ -40,6 +40,25 @@ If nothing matches, the current directory is used. The filesystem root and your 
 
 The index is cached in SQLite and refreshed incrementally before queries. Only files whose modification time and size changed are re-read, and only files whose content changed are re-parsed. You never need to rescan by hand.
 
+**One index per project, always current.** The cache lives in that project's own `<root>/.trace/trace.db`, so projects never share or mix indexes, and each has its own daemon.
+
+Refreshes update the index in place — they never stack up:
+
+- One row per file, keyed by its path: re-indexing a file **replaces** its entry.
+- A deleted, ignored, oversized or now-binary file loses its entry.
+- The cache therefore holds exactly the files that exist now, no matter how often you scan.
+- After a project shrinks a lot, the database file is compacted so the freed space is returned.
+
+It also rebuilds itself whenever the cache cannot be trusted:
+
+| Situation | What happens |
+|---|---|
+| A trace release changes how files are parsed | Entries from the older extractor are dropped and every file is re-parsed automatically |
+| A cached entry is unreadable | That file is re-parsed |
+| `trace.db` is corrupt or not a database | It is moved aside as `trace.db.corrupt-<timestamp>` and a fresh one is created |
+| You want a clean rebuild | `trace scan --reset` discards the cache and re-indexes everything; `trace scan --full` re-parses every file, keeping the cache |
+| You want to start over completely | Delete `<root>/.trace/` (this also deletes session history) |
+
 **Languages:**
 
 | Language | Extensions |
@@ -738,7 +757,7 @@ trace <command> [options]      trace --help / trace <command> --help / man trace
 |---|---|
 | `trace serve [ROOT] [--inline]` | MCP over stdio for an agent. Connects to (and if needed starts) the project's daemon; `--inline` serves in-process. |
 | `trace daemon [ROOT] [--idle-timeout SECS]` | Run the project's daemon in the foreground (Unix). `0` (default) never idles out. |
-| `trace scan [ROOT] [--full] [--json]` | Refresh the index and print statistics; `--full` re-parses everything. |
+| `trace scan [ROOT] [--full] [--reset] [--json]` | Refresh the index and print statistics. `--full` re-parses every file; `--reset` discards the cached index first and rebuilds from scratch. |
 | `trace check [FILES…] [--root ROOT] [--strict] [--json]` | Evaluate files (default: every source file) against the rules. |
 | `trace status [ROOT] [--json]` | Root, index size, rules state, decision count, sessions, daemon PID and socket. |
 | `trace setup [--dry-run] [--remove] [--root ROOT]` | Register or unregister trace with installed agents. |
@@ -937,7 +956,11 @@ Stale daemons from older versions keep their own sockets. Stop them with `pkill 
 
 **Resetting a project**
 
-`rm -rf .trace` removes the index cache and session history. ADRs and rules are untouched.
+`trace scan --reset` rebuilds the index from scratch and keeps your session history. `rm -rf .trace` removes the index *and* the history. ADRs and rules are untouched either way.
+
+**"is not a usable database"**
+
+The project's `trace.db` was damaged (a full disk or a killed process mid-write). trace moves it to `trace.db.corrupt-<timestamp>` and starts a new one; the index rebuilds on the next scan, but session history in the old file is lost. Delete the quarantined file once you no longer need it.
 
 **Debug the raw protocol**
 
