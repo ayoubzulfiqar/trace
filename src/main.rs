@@ -66,6 +66,9 @@ enum Commands {
         /// Re-parse every file instead of only changed ones
         #[arg(long)]
         full: bool,
+        /// Discard the cached index and rebuild it from scratch
+        #[arg(long, conflicts_with = "full")]
+        reset: bool,
         /// Machine-readable output
         #[arg(long)]
         json: bool,
@@ -224,7 +227,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 bail!("daemon mode needs Unix sockets (Linux/macOS); `trace serve` runs inline on this platform");
             }
         }
-        Commands::Scan { root, full, json } => return scan(resolve_root(root)?, full, json),
+        Commands::Scan {
+            root,
+            full,
+            reset,
+            json,
+        } => return scan(resolve_root(root)?, full, reset, json),
         Commands::Check {
             files,
             root,
@@ -261,7 +269,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn scan(root: PathBuf, full: bool, as_json: bool) -> Result<ExitCode> {
+fn scan(root: PathBuf, full: bool, reset: bool, as_json: bool) -> Result<ExitCode> {
     let server = Server::new(root.clone());
     if let Some(reason) = server.blocked_reason() {
         bail!("{reason}");
@@ -269,7 +277,11 @@ fn scan(root: PathBuf, full: bool, as_json: bool) -> Result<ExitCode> {
     if !as_json {
         eprintln!("Scanning {} ...", root.display());
     }
-    let mode = if full { Refresh::Full } else { Refresh::Now };
+    let mode = match (reset, full) {
+        (true, _) => Refresh::Reset,
+        (_, true) => Refresh::Full,
+        _ => Refresh::Now,
+    };
     let stats = server
         .ensure_index(mode)
         .map_err(anyhow::Error::msg)?
