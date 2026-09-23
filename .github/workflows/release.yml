@@ -181,15 +181,41 @@ jobs:
 
       - name: Install and smoke-test the package
         run: |
+          set -eu
+          # Install to prove the package resolves and the binary runs, then
+          # check the payload from the package file rather than from disk:
+          # container images routinely refuse to extract man pages and docs.
           case "${{ matrix.kind }}" in
-            deb) apt-get install -y ./dist/*.deb ;;
-            # Container images set tsflags=nodocs, which would drop the man page.
-            rpm) dnf install -y --setopt=tsflags= ./dist/*.rpm ;;
-            arch) pacman -U --noconfirm dist/*.pkg.tar.zst ;;
+            deb)
+              apt-get install -y ./dist/*.deb
+              dpkg --contents ./dist/*.deb > contents.txt
+              ;;
+            rpm)
+              dnf install -y ./dist/*.rpm
+              rpm -qlp ./dist/*.rpm > contents.txt
+              ;;
+            arch)
+              pacman -U --noconfirm dist/*.pkg.tar.zst
+              bsdtar -tf dist/*.pkg.tar.zst > contents.txt
+              ;;
           esac
           trace --version
-          test -f /usr/share/man/man1/trace.1.gz
-          test -f /usr/share/bash-completion/completions/trace
+          trace --help > /dev/null
+          echo '--- package contents ---'
+          cat contents.txt
+          # The man page extension varies: .gz on Debian and Fedora, whatever
+          # makepkg's zipman produces on Arch.
+          for path in \
+            'usr/bin/trace' \
+            'usr/share/man/man1/trace\.1(\.[a-z0-9]+)?' \
+            'usr/share/bash-completion/completions/trace' \
+            'usr/share/zsh/[a-z-]+/_trace'
+          do
+            grep -Eq "(^|/)${path}\$" contents.txt || {
+              echo "missing from package: ${path}" >&2
+              exit 1
+            }
+          done
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
