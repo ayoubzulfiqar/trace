@@ -97,18 +97,22 @@ build_arch() {
     work="$(mktemp -d)"
     cp packaging/arch/PKGBUILD "$work/"
     sed -i "s/^pkgver=.*/pkgver=${VERSION}/" "$work/PKGBUILD"
+    # The source here is a tarball of this tree, not the release tag, so its
+    # checksum cannot match whatever the PKGBUILD pins (and computing one
+    # would need pacman-contrib for updpkgsums).
+    sed -i "s/^sha256sums=.*/sha256sums=('SKIP')/" "$work/PKGBUILD"
     tar --exclude=./target --exclude=./dist --exclude=./.git --exclude=./.trace \
         --transform "s,^\.,trace-${VERSION}," -czf "$work/trace-${VERSION}.tar.gz" .
     if is_root; then
         id builder >/dev/null 2>&1 || useradd -m builder
         chown -R builder "$work"
-        su builder -c "cd '$work' && updpkgsums && makepkg --noconfirm ${MAKEPKG_FLAGS:-}"
+        su builder -c "cd '$work' && makepkg --noconfirm ${MAKEPKG_FLAGS:-}"
     else
         # shellcheck disable=SC2086 # MAKEPKG_FLAGS may hold several flags
-        (cd "$work" && updpkgsums && makepkg --noconfirm ${MAKEPKG_FLAGS:-})
+        (cd "$work" && makepkg --noconfirm ${MAKEPKG_FLAGS:-})
     fi
     cp "$work"/trace-"${VERSION}"-*.pkg.tar.zst "$DIST/"
-    cp "$work/PKGBUILD" "$DIST/PKGBUILD"
+    cp packaging/arch/PKGBUILD "$DIST/PKGBUILD"
 }
 
 install_deps
