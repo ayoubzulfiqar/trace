@@ -92,7 +92,7 @@ Release binaries and Linux packages are built by GitHub Actions (`.github/workfl
 | Fedora `.rpm` (x86_64, aarch64) | `fedora:latest` | `cargo generate-rpm` | `[package.metadata.generate-rpm]` in `Cargo.toml` |
 | Arch `.pkg.tar.zst` (x86_64) | `archlinux:base-devel` | `makepkg` | `packaging/arch/PKGBUILD` |
 
-Every package ships the binary, the man page (`trace man`), bash/zsh/fish completions (`trace completions`), the README, the usage guide and the changelog. When adding a file to the packages, update all three definitions.
+Every package ships the binary, the man page (`trace man`), bash/zsh/fish completions (`trace completions`), the README, the changelog, and the whole of `docs/` under `/usr/share/doc/trace/guide/`. When adding a documentation page, add it to all three definitions (the Arch `package()` installs `docs/*.md` by glob; the deb and rpm asset lists name each file).
 
 The script can also be run by hand from the source root on a machine (or container) of the target distribution: `packaging/build-package.sh deb|rpm|arch`. As root it installs its own build dependencies, and packages land in `dist/`.
 
@@ -100,7 +100,7 @@ The script can also be run by hand from the source root on a machine (or contain
 
 1. Bump `version` in `Cargo.toml` and run `cargo build` so `Cargo.lock` follows.
 2. Set `pkgver` in `packaging/arch/PKGBUILD` (and reset `pkgrel=1`).
-3. Add a section to `CHANGELOG.md` and update version examples in `README.md` and `docs/USAGE.md`.
+3. Add a section to `CHANGELOG.md` and update the version examples in `README.md` and `docs/` (`rg -n '2\.6\.' README.md docs/`).
 4. Commit, then tag and push: `git tag v2.6.9 && git push origin v2.6.9`.
 
 The release workflow then:
@@ -123,6 +123,7 @@ A failed distribution package doesn't block the portable binaries. To rebuild an
 - [ ] `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings` and `cargo test` pass
 - [ ] New behaviour is covered by tests
 - [ ] README / inline docs are updated
+- [ ] User-facing changes are reflected in `docs/` (the index is `docs/README.md`), and internal links still resolve
 
 ## Reporting Issues
 
