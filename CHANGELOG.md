@@ -2,6 +2,18 @@
 
 All notable changes to trace are documented here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Release packaging:** the Arch job failed because `updpkgsums` ships in `pacman-contrib`, not `base-devel`; the CI build now pins the local tarball with `SKIP` instead. The Fedora job built and installed its package correctly but its smoke test failed, because container images set `tsflags=nodocs` and skip the man page; the test now installs with `--setopt=tsflags=`.
+- **A corrupt `trace.db` is repaired instead of disabling persistence.** It is moved aside as `trace.db.corrupt-<timestamp>` and replaced, so the index cache and session history keep working (previously every run fell back to an in-memory store).
+
+### Added
+
+- `trace scan --reset` discards the cached index and rebuilds it from scratch, keeping session history.
+- The index database is compacted after a rebuild, or after a project loses a large share of its files, so freed space is returned to the filesystem.
+
 ## [2.6.9] — 2026-09-22
 
 A ground-up audit and rewrite of the engine, protocol layer, transport and tooling.
