@@ -107,6 +107,8 @@ pub enum Refresh {
     Now,
     /// Re-parse every file.
     Full,
+    /// Discard the cached index and rebuild it from scratch.
+    Reset,
 }
 
 #[derive(Default)]
@@ -237,6 +239,13 @@ impl Server {
         {
             return Ok(None);
         }
+        if mode == Refresh::Reset {
+            if let Err(e) = lock(&self.store).clear_index() {
+                eprintln!("trace: could not clear the index cache: {e}");
+            }
+            write(&self.graph).files.clear();
+            state.cache_loaded = true;
+        }
         if !state.cache_loaded {
             let cached = lock(&self.store).load_index().unwrap_or_else(|e| {
                 eprintln!("trace: ignoring unreadable index cache: {e}");
@@ -245,9 +254,13 @@ impl Server {
             write(&self.graph).files = cached.into_iter().collect();
             state.cache_loaded = true;
         }
-        let changes = {
+        let rebuild = matches!(mode, Refresh::Full | Refresh::Reset);
+        let (changes, files_before) = {
             let graph = read(&self.graph);
-            scan::compute_changes(&graph, &self.root, mode == Refresh::Full)
+            (
+                scan::compute_changes(&graph, &self.root, rebuild),
+                graph.files.len(),
+            )
         };
         if !changes.is_empty() {
             if let Err(e) = lock(&self.store).save_index_changes(
@@ -256,6 +269,14 @@ impl Server {
                 &changes.removed,
             ) {
                 eprintln!("trace: failed to persist index changes: {e}");
+            }
+        }
+        // Reclaim the file after a rebuild or a project that shrank a lot;
+        // otherwise freed pages are simply reused.
+        let shrank = changes.removed.len() >= 64 && changes.removed.len() * 2 >= files_before;
+        if rebuild || shrank {
+            if let Err(e) = lock(&self.store).vacuum() {
+                eprintln!("trace: could not compact the index cache: {e}");
             }
         }
         let stats = changes.stats.clone();
@@ -1918,6 +1939,34 @@ mod tests {
         );
         assert_eq!(callers["total"], 1, "{callers}");
         warmup.join().unwrap();
+    }
+
+    #[test]
+    fn reset_rebuilds_the_cache_from_scratch() {
+        let (dir, server) =
+            project(&[("src/a.rs", "pub fn a() {}"), ("src/b.rs", "pub fn b() {}")]);
+        server.ensure_index(Refresh::Now).unwrap();
+        assert_eq!(server.store_counts().0, 2);
+        // A stale row for a file that no longer exists, plus a vanished file.
+        std::fs::remove_file(dir.path().join("src/b.rs")).unwrap();
+        {
+            let store = lock(&server.store);
+            store
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO file_index VALUES ('gone.rs', 1, 1, 1, 4, '{}')",
+                    [],
+                )
+                .unwrap();
+        }
+        let stats = server.ensure_index(Refresh::Reset).unwrap().unwrap();
+        assert_eq!(stats.reparsed, 1, "{stats:?}");
+        assert_eq!(
+            server.store_counts().0,
+            1,
+            "cache holds exactly the live files"
+        );
+        assert_eq!(server.index_stats().files, 1);
     }
 
     #[test]
