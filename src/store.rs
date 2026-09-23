@@ -82,6 +82,29 @@ CREATE INDEX IF NOT EXISTS idx_sessions_timestamp ON sessions(timestamp);
 CREATE INDEX IF NOT EXISTS idx_touched_files_path ON touched_files(file_path);
 "#;
 
+/// Does this error mean the file on disk is not a usable database?
+fn is_corrupt(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(e, _)
+            if matches!(
+                e.code,
+                rusqlite::ErrorCode::NotADatabase | rusqlite::ErrorCode::DatabaseCorrupt
+            )
+    )
+}
+
+/// Move a damaged database (and its WAL sidecars) out of the way.
+fn quarantine(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = path.file_name()?.to_string_lossy().to_string();
+    let to = path.with_file_name(format!("{name}.corrupt-{}", now_ms()));
+    let renamed = std::fs::rename(path, &to).is_ok();
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(path.with_file_name(format!("{name}{suffix}")));
+    }
+    renamed.then_some(to)
+}
+
 /// Run `op`, retrying while SQLite reports the database busy/locked
 /// (up to ~5 s with backoff).
 fn retry_busy<T>(mut op: impl FnMut() -> SqlResult<T>) -> SqlResult<T> {
@@ -119,7 +142,27 @@ pub struct SessionWithFiles {
 impl TraceStore {
     /// Open (or create) the SQLite database at `path`, migrating it to the
     /// current schema.
+    /// A damaged database is moved aside and replaced, so a project never
+    /// gets stuck without persistence.
     pub fn open(path: &std::path::Path) -> SqlResult<Self> {
+        match Self::open_at(path) {
+            Err(e) if is_corrupt(&e) => {
+                let moved = quarantine(path);
+                eprintln!(
+                    "trace: {} is not a usable database ({e}){}; starting a new one",
+                    path.display(),
+                    match &moved {
+                        Some(to) => format!("; moved it to {}", to.display()),
+                        None => String::new(),
+                    }
+                );
+                Self::open_at(path)
+            }
+            other => other,
+        }
+    }
+
+    fn open_at(path: &std::path::Path) -> SqlResult<Self> {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -268,6 +311,12 @@ impl TraceStore {
             }
         }
         tx.commit()
+    }
+
+    /// Rewrite the database file, releasing pages freed by removed files.
+    /// Must not run inside a transaction.
+    pub fn vacuum(&self) -> SqlResult<()> {
+        self.conn.execute_batch("VACUUM")
     }
 
     /// Drop the whole structural index cache.
@@ -691,6 +740,73 @@ mod tests {
                     .expect("open must not fail with database is locked");
             }
         }
+    }
+
+    #[test]
+    fn a_corrupt_database_is_replaced_and_usable() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.db");
+        std::fs::write(&path, b"this is definitely not a sqlite database").unwrap();
+        std::fs::write(dir.path().join("trace.db-wal"), b"stale wal").unwrap();
+
+        let mut store = TraceStore::open(&path).expect("a corrupt database is replaced");
+        store
+            .record_session(&session("s1", 1, "agent"), &[touched("s1", "a.rs", "why")])
+            .unwrap();
+        assert_eq!(store.get_recent_history(5).unwrap().len(), 1);
+
+        let quarantined: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains(".corrupt-"))
+            .collect();
+        assert_eq!(quarantined.len(), 1, "the old file is kept for inspection");
+        // A fresh WAL belongs to the new database; the stale one is gone.
+        let wal = std::fs::read(dir.path().join("trace.db-wal")).unwrap_or_default();
+        assert_ne!(wal, b"stale wal", "the stale sidecar was discarded");
+
+        // Re-opening the fresh database must not quarantine it again.
+        drop(store);
+        assert!(TraceStore::open(&path).is_ok());
+        let still: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".corrupt-"))
+            .collect();
+        assert_eq!(still.len(), 1);
+    }
+
+    #[test]
+    fn vacuum_releases_space_after_removals() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("trace.db");
+        let mut store = TraceStore::open(&path).unwrap();
+        let entry = |rel: &str| IndexedFile {
+            mtime_ns: 1,
+            size: 1,
+            hash: 1,
+            facts: extract_file(rel, &"pub fn padding_to_make_rows_large() {}\n".repeat(40)),
+        };
+        let upserts: Vec<(String, IndexedFile)> = (0..300)
+            .map(|i| (format!("src/f{i}.rs"), entry(&format!("src/f{i}.rs"))))
+            .collect();
+        store.save_index_changes(&upserts, &[], &[]).unwrap();
+        let removed: Vec<String> = upserts.iter().skip(5).map(|(rel, _)| rel.clone()).collect();
+        store.save_index_changes(&[], &[], &removed).unwrap();
+        // In WAL mode the pages live in the sidecar until a checkpoint.
+        let checkpoint = |store: &TraceStore| {
+            store
+                .conn
+                .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .unwrap();
+            std::fs::metadata(&path).unwrap().len()
+        };
+        let before = checkpoint(&store);
+        store.vacuum().unwrap();
+        let after = checkpoint(&store);
+        assert!(after < before, "vacuum should shrink {before} -> {after}");
+        assert_eq!(store.load_index().unwrap().len(), 5);
     }
 
     #[test]
