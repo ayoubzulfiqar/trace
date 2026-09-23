@@ -183,7 +183,8 @@ jobs:
         run: |
           case "${{ matrix.kind }}" in
             deb) apt-get install -y ./dist/*.deb ;;
-            rpm) dnf install -y ./dist/*.rpm ;;
+            # Container images set tsflags=nodocs, which would drop the man page.
+            rpm) dnf install -y --setopt=tsflags= ./dist/*.rpm ;;
             arch) pacman -U --noconfirm dist/*.pkg.tar.zst ;;
           esac
           trace --version
